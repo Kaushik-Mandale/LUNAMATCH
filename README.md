@@ -1,11 +1,11 @@
 <div align="center">
 
+<a href="https://lunamatch.streamlit.app" target="_blank"><img src="https://img.shields.io/badge/Live%20Demo-Streamlit%20Cloud-ff4b4b?style=for-the-badge&logo=streamlit&logoColor=white"/></a>
 <img src="https://img.shields.io/badge/Team-Akatsuki-red?style=for-the-badge&logo=rocket&logoColor=white"/>
 <img src="https://img.shields.io/badge/Python-3.14-blue?style=for-the-badge&logo=python&logoColor=white"/>
 <img src="https://img.shields.io/badge/Deep%20Learning-LoFTR-purple?style=for-the-badge&logo=pytorch&logoColor=white"/>
 <img src="https://img.shields.io/badge/OpenCV-4.10-green?style=for-the-badge&logo=opencv&logoColor=white"/>
-<img src="https://img.shields.io/badge/Streamlit-1.63-ff4b4b?style=for-the-badge&logo=streamlit&logoColor=white"/>
-<img src="https://img.shields.io/badge/Tests-35%20passed-brightgreen?style=for-the-badge&logo=pytest&logoColor=white"/>
+<img src="https://img.shields.io/badge/Tests-40%20passed-brightgreen?style=for-the-badge&logo=pytest&logoColor=white"/>
 
 # 🌙 LunaMatch — Lunar Image Correspondence Engine
 
@@ -157,6 +157,10 @@ streamlit run app_v3.py
 ```
 
 Then open [http://localhost:8501](http://localhost:8501) in your browser.
+
+### Live Demo
+
+Try the deployed application: [LunaMatch V3 · Streamlit](https://lunamatch.streamlit.app/)
 
 ### CLI Verification Scripts
 
