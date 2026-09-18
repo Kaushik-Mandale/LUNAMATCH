@@ -1,0 +1,8 @@
+numpy
+pandas
+opencv-python-headless
+rasterio
+streamlit
+Pillow
+torch
+kornia
