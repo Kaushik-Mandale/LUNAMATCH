@@ -117,3 +117,38 @@ def test_parse_metadata_xml_accepts_camel_case_and_ground_distance_gsd_tags():
     assert meta["gsd_m_per_pixel"] == 5.0
     assert meta["valid"] is False
     assert "Missing footprint coordinates" in meta["validation_errors"]
+
+
+def test_parse_metadata_xml_extracts_gsd_from_comment_or_optical_formula():
+    xml = b'''<Product>
+  <Observation_Area>
+    <Time_Coordinates>
+      <start_date_time>2023-06-12T22:18:42Z</start_date_time>
+      <stop_date_time>2023-06-12T22:28:35Z</stop_date_time>
+    </Time_Coordinates>
+    <Primary_Result_Summary><processing_level>Derived</processing_level></Primary_Result_Summary>
+    <Observing_System>
+      <Observing_System_Component type="Instrument"><name>terrain mapping camera</name></Observing_System_Component>
+    </Observing_System>
+  </Observation_Area>
+  <Mission_Area>
+    <Geometry_Parameters>
+      <spacecraft_altitude>110.59 km</spacecraft_altitude>
+      <focal_length unit="mm">140</focal_length>
+      <detector_pixel_width unit="micrometer">7</detector_pixel_width>
+      <roll>0</roll><pitch>0</pitch><yaw>0</yaw>
+      <sun_azimuth>1</sun_azimuth><sun_elevation>2</sun_elevation><solar_incidence>3</solar_incidence>
+    </Geometry_Parameters>
+  </Mission_Area>
+  <File_Area_Observational>
+    <File>
+      <comment>This File contains the ortho image derived data product with 5 meter resolution</comment>
+    </File>
+  </File_Area_Observational>
+</Product>'''
+
+    meta = app_v3.parse_metadata_xml(xml)
+    assert meta["sensor_type"] == "TMC"
+    assert meta["gsd_m_per_pixel"] == 5.0
+    assert "description" in meta["gsd_source"]
+

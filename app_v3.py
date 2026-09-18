@@ -733,6 +733,22 @@ def parse_chandrayaan2_pds4_xml(data: bytes | str, name: str = "") -> dict:
         )
     )
 
+    if gsd_m_per_pixel is None:
+        for elem in root.iter():
+            tag_name = _local_tag(elem).lower()
+            if tag_name in ("comment", "description") and elem.text:
+                m = re.search(r"(\d+(?:\.\d+)?)\s*(?:meter|m)\s+resolution", elem.text, re.IGNORECASE)
+                if m:
+                    gsd_m_per_pixel = float(m.group(1))
+                    gsd_source = "extracted from product description"
+                    break
+
+    if gsd_m_per_pixel is None and altitude_km and detector_pixel_width_um and focal_length_mm:
+        calc = (altitude_km * 1000.0) * (detector_pixel_width_um * 1e-6) / (focal_length_mm * 1e-3)
+        if 0.01 <= calc <= 1000.0:
+            gsd_m_per_pixel = round(calc, 2)
+            gsd_source = "computed from focal length, detector width and altitude"
+
     # 7. Refined Corner Coordinates / Footprint
     ul_lat = _parse_float(_find_text(root, [".//isda:upper_left_latitude", ".//pds:upper_left_latitude"], ["upper_left_latitude", "upperleftlatitude"]))
     ul_lon = _parse_float(_find_text(root, [".//isda:upper_left_longitude", ".//pds:upper_left_longitude"], ["upper_left_longitude", "upperleftlongitude"]))
