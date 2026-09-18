@@ -1,0 +1,22 @@
+<metadata>
+  <product>
+    <image>
+      <latitude>12.345</latitude>
+      <longitude>67.890</longitude>
+      <resolution_gsd>0.24</resolution_gsd>
+      <altitude>123.4</altitude>
+      <sun_azimuth>45.5</sun_azimuth>
+      <sun_elevation>12.3</sun_elevation>
+      <solar_incidence>34.0</solar_incidence>
+      <roll>1.1</roll>
+      <pitch>2.2</pitch>
+      <yaw>3.3</yaw>
+      <footprint_corners>0,0;100,0;100,100;0,100</footprint_corners>
+      <sensor_type>OHRC</sensor_type>
+      <processing_level>Level2</processing_level>
+      <image_width>512</image_width>
+      <image_height>512</image_height>
+      <projection>WGS84</projection>
+    </image>
+  </product>
+</metadata>

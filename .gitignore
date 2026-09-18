@@ -1,0 +1,29 @@
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.pytest_cache/
+.env
+*.egg-info/
+dist/
+build/
+*.log
+*.DS_Store
+# Large data / science files
+*.tif
+*.tiff
+*.fits
+*.img
+*.lbr
+*.oat
+*.spm
+*.zip
+# Torch / model checkpoints - too large for git
+*.ckpt
+*.pt
+*.pth
+# IDE and Agent tooling
+.vscode/
+.idea/
+.agents/
