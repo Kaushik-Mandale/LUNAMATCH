@@ -18,6 +18,7 @@ from rasterio.enums import Resampling
 from rasterio.io import MemoryFile
 
 import loftr_matcher
+import iirs_preprocessing
 
 logger = logging.getLogger("lunamatch_v3")
 
@@ -43,6 +44,44 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 SENSORS = ["OHRC", "TMC", "IIRS", "Unknown"]
+SENSORS_UI = ["Auto Detect", "OHRC", "TMC-2", "IIRS"]
+
+# Canonical sensor token for 'TMC-2' UI label (both map to same routing token)
+_TMC_TOKENS = {"TMC", "TMC-2", "TMC2"}
+
+
+def _canonical_sensor(sensor_ui: str) -> str:
+    """Normalise UI sensor label to the canonical pipeline token.
+
+    - 'TMC-2' -> 'TMC'  (keeps test contracts that compare against 'TMC')
+    - 'Auto Detect' -> 'Unknown' (resolved later from metadata / filename)
+    - Everything else is returned as-is.
+    """
+    s = (sensor_ui or "").strip().upper()
+    if s in {"TMC-2", "TMC2"}:
+        return "TMC"
+    if s == "AUTO DETECT":
+        return "Unknown"
+    return s if s else "Unknown"
+
+
+def detect_sensor_from_filename(name: str) -> str:
+    """Infer Chandrayaan-2 sensor from product filename patterns.
+
+    ch2_iir* -> 'IIRS'
+    ch2_ohr* -> 'OHRC'
+    ch2_tmc* -> 'TMC'
+    Returns 'Unknown' when no pattern matches.
+    """
+    lname = (name or "").lower()
+    if "ch2_iir" in lname or "iirs" in lname:
+        return "IIRS"
+    if "ch2_ohr" in lname or "ohrc" in lname:
+        return "OHRC"
+    if "ch2_tmc" in lname or "tmc" in lname:
+        return "TMC"
+    return "Unknown"
+
 
 
 @dataclass
@@ -1093,7 +1132,145 @@ def make_representations(gray: np.ndarray, mask: np.ndarray):
     return local, structure, mag
 
 
-def load_working_image(data: bytes, name: str, band: int, max_side: int) -> WorkingImage:
+def load_iirs_working_image(
+    data: bytes,
+    name: str,
+    max_side: int,
+    iirs_representation: str = "automatic",
+    pca_component: int = 1,
+    normalization: str = "percentile",
+    invalid_handling: str = "automatic",
+    resolution_handling: str = "automatic",
+    source_gsd: Optional[float] = None,
+    reference_gsd: Optional[float] = None,
+) -> Tuple["WorkingImage", dict]:
+    """Load an IIRS hyperspectral input and produce a WorkingImage for spatial matching.
+
+    Uses iirs_preprocessing to load the full spectral cube, mask invalid pixels,
+    normalize spectral bands, and synthesize a 2D spatial representation (PCA PC1
+    by default) which is then passed through the standard spatial enhancement
+    pipeline (CLAHE, Sobel, Laplacian structure) to produce gray/structure/gradient
+    arrays compatible with SIFT and LoFTR matching.
+
+    NOTE: SIFT is applied to the derived 2D representation — it is NOT a hyperspectral
+    matcher.  The representation method is explicitly recorded in the diagnostic dict.
+
+    Returns:
+        working: WorkingImage ready for the matching pipeline.
+        diag:    Diagnostic dict for the IIRS Matching Representation preview panel.
+    """
+    # 1. Load the hyperspectral cube (bands, height, width)
+    cube, meta = iirs_preprocessing.load_iirs(data, name)
+
+    # 2. Remove invalid pixels (NoData sentinels, NaNs, extreme values)
+    cube_clean, valid_mask = iirs_preprocessing.remove_invalid_pixels(cube, no_data_value=-9999.0)
+
+    # 3. Validate cube
+    validation = iirs_preprocessing.validate_iirs_cube(cube_clean)
+    if not validation["valid"]:
+        raise ValueError(
+            "IIRS cube validation failed: " + "; ".join(validation["errors"])
+        )
+
+    # 4. Normalize
+    norm_method = normalization if normalization in ("percentile", "standardization", "none") else "percentile"
+    cube_norm, valid_mask = iirs_preprocessing.normalize_iirs(cube_clean, valid_mask, method=norm_method)
+
+    # 5. Resolution-aware scale info (informational, logged into diag)
+    gsd_info: dict = {}
+    if source_gsd is not None and reference_gsd is not None:
+        gsd_info = iirs_preprocessing.compute_resolution_scale_ratio(source_gsd, reference_gsd)
+
+    # 6. Generate 2D spatial representation from the spectral cube
+    rep_2d, rep_diag = iirs_preprocessing.generate_iirs_2d_representation(
+        cube_norm, valid_mask,
+        method=iirs_representation,
+        pca_component=pca_component,
+        apply_clahe=True,
+    )
+
+    # 7. Resize to working resolution (respecting max_side budget)
+    h_orig, w_orig = rep_2d.shape[:2]
+    factor = min(1.0, max_side / max(h_orig, w_orig, 1))
+    oh = max(1, int(round(h_orig * factor)))
+    ow = max(1, int(round(w_orig * factor)))
+
+    rep_resized = cv2.resize(rep_2d, (ow, oh), interpolation=cv2.INTER_LINEAR)
+    valid_resized = cv2.resize(
+        valid_mask.astype(np.uint8), (ow, oh), interpolation=cv2.INTER_NEAREST
+    ).astype(bool)
+    valid_uint8 = valid_resized.astype(np.uint8) * 255
+
+    # 8. Build illumination-tolerant spatial representations (CLAHE already applied)
+    local, structure, gradient = make_representations(rep_resized, valid_uint8)
+
+    sx = w_orig / max(ow, 1)
+    sy = h_orig / max(oh, 1)
+    to_original = np.array(
+        [[sx, 0, (sx - 1) / 2], [0, sy, (sy - 1) / 2], [0, 0, 1]], dtype=np.float64
+    )
+
+    info = {
+        "filename": name,
+        "width": w_orig,
+        "height": h_orig,
+        "bands": cube.shape[0],
+        "dtype": str(cube.dtype),
+        "format": meta.get("format", "IIRS"),
+        "sensor_type": "IIRS",
+        "gsd_m_per_pixel": meta.get("gsd_m_per_pixel"),
+    }
+
+    diag = {
+        **rep_diag,
+        "cube_bands": cube.shape[0],
+        "cube_shape": (cube.shape[0], h_orig, w_orig),
+        "valid_pixel_pct": round(float(np.mean(valid_mask)) * 100, 2),
+        "normalization_method": norm_method,
+        "representation": rep_diag.get("method_applied", iirs_representation),
+        "estimated_gsd_m": meta.get("gsd_m_per_pixel"),
+        "scale_ratio_info": gsd_info,
+        "warnings": meta.get("warnings", []),
+    }
+
+    working = WorkingImage(rep_resized, structure, gradient, valid_uint8, to_original, info)
+    return working, diag
+
+
+def load_working_image(
+    data: bytes,
+    name: str,
+    band: int,
+    max_side: int,
+    sensor_type: str = "",
+    iirs_representation: str = "automatic",
+    pca_component: int = 1,
+    normalization: str = "percentile",
+    invalid_handling: str = "automatic",
+    resolution_handling: str = "automatic",
+    source_gsd: Optional[float] = None,
+    reference_gsd: Optional[float] = None,
+) -> "WorkingImage":
+    """Route image loading to IIRS or standard pipeline based on sensor_type.
+
+    When sensor_type is 'IIRS', delegates to load_iirs_working_image which loads the
+    full hyperspectral cube and synthesizes a 2D matching representation (PCA by default).
+    All other sensors (OHRC, TMC) use the unchanged rasterio/PIL single-band pipeline.
+    """
+    if _canonical_sensor(sensor_type) == "IIRS":
+        working, _ = load_iirs_working_image(
+            data, name, max_side,
+            iirs_representation=iirs_representation,
+            pca_component=pca_component,
+            normalization=normalization,
+            invalid_handling=invalid_handling,
+            resolution_handling=resolution_handling,
+            source_gsd=source_gsd,
+            reference_gsd=reference_gsd,
+        )
+        return working
+
+    # Standard OHRC / TMC-2 single-band path (unchanged)
     info = inspect_image(data, name)
     width, height = info["width"], info["height"]
     factor = min(1.0, max_side / max(width, height))
@@ -1123,6 +1300,7 @@ def load_working_image(data: bytes, name: str, band: int, max_side: int) -> Work
         [[sx, 0, (sx - 1) / 2], [0, sy, (sy - 1) / 2], [0, 0, 1]], dtype=np.float64
     )
     return WorkingImage(gray, structure, gradient, mask, to_original, info)
+
 
 
 def eroded_mask(mask: np.ndarray) -> np.ndarray:
@@ -1621,7 +1799,11 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
                  ratio_threshold=0.78, grid_size=10, cell_limit=20, model="Homography",
                  ransac_threshold=2.5, subpixel=True, residual_correction=True,
                  source_metadata=None, reference_metadata=None,
-                 geometric_verifier="MAGSAC++", loftr_confidence_threshold=0.35):
+                 geometric_verifier="MAGSAC++", loftr_confidence_threshold=0.35,
+                 iirs_representation="automatic", pca_component=1,
+                 iirs_normalization="percentile", iirs_invalid_handling="automatic",
+                 iirs_resolution_handling="automatic"):
+
     start_total = time.perf_counter()
     stages = []
 
@@ -1676,9 +1858,45 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
 
     # Stage 03 - Preprocessing
     start = time.perf_counter()
+    # Extract GSD from metadata for resolution-aware scale ratio (used by IIRS preprocessing)
+    src_gsd = (source_metadata or {}).get("gsd_m_per_pixel") or (source_metadata or {}).get("resolution_gsd")
+    ref_gsd = (reference_metadata or {}).get("gsd_m_per_pixel") or (reference_metadata or {}).get("resolution_gsd")
+    # Track IIRS preprocessing diagnostics for the UI preview panel
+    _iirs_src_diag: dict = {}
+    _iirs_ref_diag: dict = {}
     try:
-        src = load_working_image(source_file.getvalue(), source_file.name, source_band, max_side)
-        ref = load_working_image(reference_file.getvalue(), reference_file.name, reference_band, max_side)
+        if _canonical_sensor(source_sensor) == "IIRS":
+            src, _iirs_src_diag = load_iirs_working_image(
+                source_file.getvalue(), source_file.name, max_side,
+                iirs_representation=iirs_representation,
+                pca_component=pca_component,
+                normalization=iirs_normalization,
+                invalid_handling=iirs_invalid_handling,
+                resolution_handling=iirs_resolution_handling,
+                source_gsd=src_gsd,
+                reference_gsd=ref_gsd,
+            )
+        else:
+            src = load_working_image(
+                source_file.getvalue(), source_file.name, source_band, max_side,
+                sensor_type=source_sensor,
+            )
+        if _canonical_sensor(reference_sensor) == "IIRS":
+            ref, _iirs_ref_diag = load_iirs_working_image(
+                reference_file.getvalue(), reference_file.name, max_side,
+                iirs_representation=iirs_representation,
+                pca_component=pca_component,
+                normalization=iirs_normalization,
+                invalid_handling=iirs_invalid_handling,
+                resolution_handling=iirs_resolution_handling,
+                source_gsd=ref_gsd,
+                reference_gsd=src_gsd,
+            )
+        else:
+            ref = load_working_image(
+                reference_file.getvalue(), reference_file.name, reference_band, max_side,
+                sensor_type=reference_sensor,
+            )
         preprocess_status = "success"
         preprocess_error = None
     except Exception as exc:
@@ -1686,6 +1904,7 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
         preprocess_error = str(exc)
         src = None
         ref = None
+
     processing_time = time.perf_counter() - start
     stages.append(make_stage("03", "Preprocessing", preprocess_status,
                            {"source": source_file.name, "reference": reference_file.name},
@@ -2136,6 +2355,7 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
             "sensor_relation": "same_sensor" if sensor_path == "same" else "cross_sensor",
             "source_sensor": source_sensor,
             "reference_sensor": reference_sensor,
+            "sensor_pair": f"{source_sensor} ↔ {reference_sensor}",
             "matcher": actual_matcher,
             "geometric_verifier": geom_info.get("verifier_method", geometric_verifier),
             "primary_verifier": geometric_verifier,
@@ -2149,7 +2369,15 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
             "loftr_available": loftr_avail,
             "loftr_metrics": loftr_metrics,
             "loftr_note": "LoFTR provides cross-modal transformer correspondences with self/cross-attention across multimodal Chandrayaan-2 imagery.",
+            # IIRS-specific fields (populated when one or both sensors is IIRS)
+            "source_gsd_m": src_gsd,
+            "reference_gsd_m": ref_gsd,
+            "scale_ratio": round(src_gsd / ref_gsd, 3) if (src_gsd and ref_gsd and ref_gsd > 0) else None,
+            "iirs_source_representation": _iirs_src_diag.get("representation") if _iirs_src_diag else None,
+            "iirs_reference_representation": _iirs_ref_diag.get("representation") if _iirs_ref_diag else None,
+            "cross_sensor_learned_matching_label": "Cross-sensor learned matching" if sensor_path == "different" and actual_matcher == "LoFTR" else None,
         },
+
         "stages": [
             "sensor-aware input", "NoData masking and robust normalization",
             "illumination-tolerant local contrast", "gradient/second-order structural representations",
@@ -2222,11 +2450,139 @@ st.info("Research pipeline by Team Akatsuki. Low residuals are not, by themselve
 
 c1, c2 = st.columns(2)
 with c1:
-    source_sensor = st.selectbox("Source sensor", SENSORS, index=0)
-    source_file = st.file_uploader("Upload source image", type=["tif", "tiff", "png", "jpg", "jpeg"], key="source")
+    source_sensor_ui = st.selectbox(
+        "Source sensor", SENSORS_UI, index=0,
+        help="Select 'Auto Detect' to infer sensor from filename. Choose 'IIRS' for Chandrayaan-2 Imaging Infrared Spectrometer."
+    )
+    source_file = st.file_uploader(
+        "Upload source image", type=["tif", "tiff", "png", "jpg", "jpeg", "npy"], key="source"
+    )
 with c2:
-    reference_sensor = st.selectbox("Reference sensor", SENSORS, index=1)
-    reference_file = st.file_uploader("Upload reference image", type=["tif", "tiff", "png", "jpg", "jpeg"], key="reference")
+    reference_sensor_ui = st.selectbox(
+        "Reference sensor", SENSORS_UI, index=1,
+        help="Select 'Auto Detect' to infer sensor from filename."
+    )
+    reference_file = st.file_uploader(
+        "Upload reference image", type=["tif", "tiff", "png", "jpg", "jpeg", "npy"], key="reference"
+    )
+
+# Resolve canonical sensor tokens
+_src_sensor_raw = _canonical_sensor(source_sensor_ui)
+_ref_sensor_raw = _canonical_sensor(reference_sensor_ui)
+
+# Auto-detect from filename when user selected 'Auto Detect'
+if _src_sensor_raw == "Unknown" and source_file is not None:
+    _detected = detect_sensor_from_filename(source_file.name)
+    source_sensor = _detected
+    st.caption(f"Source sensor auto-detected: **{source_sensor}**")
+else:
+    source_sensor = _src_sensor_raw
+
+if _ref_sensor_raw == "Unknown" and reference_file is not None:
+    _detected_ref = detect_sensor_from_filename(reference_file.name)
+    reference_sensor = _detected_ref
+    st.caption(f"Reference sensor auto-detected: **{reference_sensor}**")
+else:
+    reference_sensor = _ref_sensor_raw
+
+# ──────────────────────────────────────────────────────
+# IIRS PROCESSING CONTROLS (shown when either sensor = IIRS)
+# ──────────────────────────────────────────────────────
+_any_iirs = (source_sensor == "IIRS" or reference_sensor == "IIRS")
+iirs_representation = "automatic"
+iirs_pca_component = 1
+iirs_normalization = "percentile"
+iirs_invalid_handling = "automatic"
+iirs_resolution_handling = "automatic"
+
+if _any_iirs:
+    with st.expander("🔬 IIRS Hyperspectral Processing", expanded=True):
+        st.info(
+            "**IIRS** is the Chandrayaan-2 Imaging Infrared Spectrometer (0.8–5.0 µm, ~256 bands, ~80 m/pixel nominal). "
+            "The hyperspectral cube is reduced to a 2D spatial representation before feature matching. "
+            "SIFT and LoFTR operate on the derived 2D representation — **not** directly on spectral data."
+        )
+        iirs_c1, iirs_c2, iirs_c3 = st.columns(3)
+        with iirs_c1:
+            iirs_representation = st.selectbox(
+                "Representation",
+                ["Automatic", "PCA", "Selected Band", "Composite", "Gradient"],
+                index=0,
+                help="'Automatic' uses PCA (PC1) for multi-band cubes. 'Selected Band' uses a single spectral band.",
+            ).lower().replace(" ", "_").replace("selected_band", "selected_band")
+            iirs_pca_component = st.selectbox("PCA Component", [1, 2, 3], index=0)
+        with iirs_c2:
+            iirs_normalization = st.selectbox(
+                "Normalization",
+                ["Percentile", "Standardization", "None"],
+                index=0,
+            ).lower()
+            iirs_invalid_handling = st.selectbox(
+                "Invalid Pixel Handling",
+                ["Automatic", "Mask", "Replace"],
+                index=0,
+            ).lower()
+        with iirs_c3:
+            iirs_resolution_handling = st.selectbox(
+                "Resolution Handling",
+                ["Automatic", "Downsample High Resolution", "Common Resolution"],
+                index=0,
+            ).lower()
+            st.markdown(
+                "**IIRS nominal GSD:** `~80 m/pixel`  \n"
+                "**OHRC GSD:** `~0.25 m/pixel`  \n"
+                "**TMC-2 GSD:** `~5 m/pixel`"
+            )
+
+        # Live IIRS Matching Representation Preview (shown after file upload)
+        if source_file is not None and source_sensor == "IIRS":
+            st.markdown("---")
+            st.markdown("#### 🛰️ IIRS Source Matching Representation Preview")
+            try:
+                _prev_cube, _prev_meta = iirs_preprocessing.load_iirs(source_file.getvalue(), source_file.name)
+                _prev_cube_clean, _prev_mask = iirs_preprocessing.remove_invalid_pixels(_prev_cube, no_data_value=-9999.0)
+                _prev_norm, _prev_mask = iirs_preprocessing.normalize_iirs(_prev_cube_clean, _prev_mask, method=iirs_normalization)
+                _prev_rep, _prev_diag = iirs_preprocessing.generate_iirs_2d_representation(
+                    _prev_norm, _prev_mask,
+                    method=iirs_representation,
+                    pca_component=iirs_pca_component,
+                    apply_clahe=True,
+                )
+                _p1, _p2, _p3, _p4 = st.columns(4)
+                _p1.metric("Spectral Bands", _prev_cube.shape[0])
+                _p2.metric("Dimensions", f"{_prev_cube.shape[2]} × {_prev_cube.shape[1]}")
+                _p3.metric("Valid Pixels", f"{_prev_diag.get('valid_pixel_pct', 0):.1f} %")
+                _p4.metric("Est. GSD", f"{_prev_meta.get('gsd_m_per_pixel', '~80')} m/px")
+                st.image(_prev_rep, caption=f"2D Representation: {_prev_diag.get('method_applied', iirs_representation)} | CLAHE: {_prev_diag.get('clahe_applied', False)}", use_container_width=True)
+                for _w in _prev_meta.get("warnings", []):
+                    st.warning(f"⚠️ {_w}")
+            except Exception as _prev_exc:
+                st.warning(f"Preview not available: {_prev_exc}")
+
+        if reference_file is not None and reference_sensor == "IIRS":
+            st.markdown("---")
+            st.markdown("#### 🛰️ IIRS Reference Matching Representation Preview")
+            try:
+                _rprev_cube, _rprev_meta = iirs_preprocessing.load_iirs(reference_file.getvalue(), reference_file.name)
+                _rprev_cube_clean, _rprev_mask = iirs_preprocessing.remove_invalid_pixels(_rprev_cube, no_data_value=-9999.0)
+                _rprev_norm, _rprev_mask = iirs_preprocessing.normalize_iirs(_rprev_cube_clean, _rprev_mask, method=iirs_normalization)
+                _rprev_rep, _rprev_diag = iirs_preprocessing.generate_iirs_2d_representation(
+                    _rprev_norm, _rprev_mask,
+                    method=iirs_representation,
+                    pca_component=iirs_pca_component,
+                    apply_clahe=True,
+                )
+                _rp1, _rp2, _rp3, _rp4 = st.columns(4)
+                _rp1.metric("Spectral Bands", _rprev_cube.shape[0])
+                _rp2.metric("Dimensions", f"{_rprev_cube.shape[2]} × {_rprev_cube.shape[1]}")
+                _rp3.metric("Valid Pixels", f"{_rprev_diag.get('valid_pixel_pct', 0):.1f} %")
+                _rp4.metric("Est. GSD", f"{_rprev_meta.get('gsd_m_per_pixel', '~80')} m/px")
+                st.image(_rprev_rep, caption=f"2D Representation: {_rprev_diag.get('method_applied', iirs_representation)} | CLAHE: {_rprev_diag.get('clahe_applied', False)}", use_container_width=True)
+                for _rw in _rprev_meta.get("warnings", []):
+                    st.warning(f"⚠️ {_rw}")
+            except Exception as _rprev_exc:
+                st.warning(f"Preview not available: {_rprev_exc}")
+
 
 metadata_expander = st.expander("IMAGE METADATA", expanded=True)
 with metadata_expander:
@@ -2391,6 +2747,11 @@ if run:
                 reference_metadata=reference_meta,
                 geometric_verifier=verifier_selected,
                 loftr_confidence_threshold=float(loftr_confidence_threshold),
+                iirs_representation=iirs_representation,
+                pca_component=int(iirs_pca_component),
+                iirs_normalization=iirs_normalization,
+                iirs_invalid_handling=iirs_invalid_handling,
+                iirs_resolution_handling=iirs_resolution_handling,
             )
         st.session_state["result"] = result
 
@@ -2406,7 +2767,13 @@ if run:
                     reference_metadata=reference_meta,
                     geometric_verifier=alt_verifier,
                     loftr_confidence_threshold=float(loftr_confidence_threshold),
+                    iirs_representation=iirs_representation,
+                    pca_component=int(iirs_pca_component),
+                    iirs_normalization=iirs_normalization,
+                    iirs_invalid_handling=iirs_invalid_handling,
+                    iirs_resolution_handling=iirs_resolution_handling,
                 )
+
             st.session_state["comp_result"] = comp_result
             st.session_state["comp_verifier"] = alt_verifier
         else:
