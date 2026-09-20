@@ -54,6 +54,16 @@ from core.product_state import (
     compute_pair_validation,
     scale_ratio_display,
 )
+from core.scientific_reader import (
+    ProductType,
+    classify_product,
+    classify_product_display_label,
+    inspect_scientific_product,
+    load_scientific_preview,
+    load_product,
+    get_raster_shape,
+    get_raster_dtype,
+)
 from experiments.manager import ExperimentManager
 
 logger = logging.getLogger("lunamatch_v3")
@@ -162,16 +172,9 @@ def detect_sensor_from_filename(name: str) -> str:
 
 def classify_product_file(name: str) -> str:
     """Classify an uploaded file without treating a preview as science data."""
-    lname = (name or "").lower()
-    if lname.endswith((".xml", ".lbl", ".txt")):
-        return "METADATA LABEL"
-    if "_brw_" in lname or "browse" in lname or "preview" in lname:
-        return "BROWSE / PREVIEW IMAGE"
-    if "_d_img_" in lname or lname.endswith((".img", ".raw", ".dat")):
-        return "SCIENTIFIC IMAGE PRODUCT"
-    if lname.endswith((".png", ".jpg", ".jpeg")):
-        return "BROWSE / PREVIEW IMAGE"
-    return "IMAGE PRODUCT"
+    if not name:
+        return "UNKNOWN"
+    return classify_product_display_label(name)
 
 
 def metadata_status(meta: dict, source: str) -> dict:
@@ -738,6 +741,7 @@ def parse_chandrayaan2_pds4_xml(data: bytes | str, name: str = "") -> dict:
                 "ground_resolution",
                 "gsd_m_per_pixel",
                 "resolution",
+                "spatial_resolution",
                 "gsd",
             ],
         )
@@ -1145,51 +1149,13 @@ def view_metadata_status(meta: dict) -> str:
 
 
 
-def inspect_image(data: bytes, name: str) -> dict:
-    """Return a real input inspection report for the uploaded raster or image.
+def inspect_image(data: bytes, name: str, metadata: Optional[dict] = None) -> dict:
+    """Return an input inspection report using product-aware routing.
 
-    Includes all fields that the Input Manager needs in the requested UI output, without
-    assuming the image is a GeoTIFF. The code reads from rasterio when the file is a TIFF,
-    and falls back to a PIL inspection when it is a PNG/JPG object.
+    Distinguishes standard images, GeoTIFFs, and scientific raw rasters (PDS3 LRO .IMG,
+    PDS4 Chandrayaan-2 .IMG) without passing raw binaries to PIL.
     """
-    if is_tiff(name):
-        with MemoryFile(data) as mem:
-            with mem.open() as ds:
-                arr = ds.read()
-                dtype = str(ds.dtypes[0])
-                valid = bool(ds.width > 0 and ds.height > 0 and ds.count >= 1)
-                return {
-                    "filename": name,
-                    "width": ds.width,
-                    "height": ds.height,
-                    "bands": ds.count,
-                    "channels": ds.count,
-                    "crs": str(ds.crs) if ds.crs else None,
-                    "dtype": dtype,
-                    "file_size_bytes": len(data),
-                    "transform": list(ds.transform) if ds.transform else None,
-                    "data_type": dtype,
-                    "valid_image_status": "Valid" if valid else "Invalid",
-                    "projection": str(ds.crs) if ds.crs else "Not available in metadata",
-                    "format": "GeoTIFF",
-                }
-    with Image.open(io.BytesIO(data)) as im:
-        arr = np.asarray(im)
-        return {
-            "filename": name,
-            "width": im.width,
-            "height": im.height,
-            "bands": len(im.getbands()),
-            "channels": len(im.getbands()),
-            "crs": None,
-            "dtype": str(arr.dtype),
-            "file_size_bytes": len(data),
-            "transform": None,
-            "data_type": str(arr.dtype),
-            "valid_image_status": "Valid" if arr.size > 0 and arr.ndim >= 2 else "Invalid",
-            "projection": "Not available in metadata",
-            "format": im.format or "Image",
-        }
+    return inspect_scientific_product(data, name, metadata=metadata)
 
 
 def normalize_uint8(arr: np.ndarray, valid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1343,12 +1309,14 @@ def load_working_image(
     resolution_handling: str = "automatic",
     source_gsd: Optional[float] = None,
     reference_gsd: Optional[float] = None,
+    metadata: Optional[dict] = None,
 ) -> "WorkingImage":
-    """Route image loading to IIRS or standard pipeline based on sensor_type.
+    """Route image loading to IIRS, scientific binary, or standard pipeline.
 
-    When sensor_type is 'IIRS', delegates to load_iirs_working_image which loads the
-    full hyperspectral cube and synthesizes a 2D matching representation (PCA by default).
-    All other sensors (OHRC, TMC) use the unchanged rasterio/PIL single-band pipeline.
+    When sensor_type is 'IIRS', delegates to load_iirs_working_image.
+    When product is a scientific binary (LRO .IMG, Chandrayaan .IMG), uses
+    load_scientific_preview driven by metadata.
+    Standard images (PNG, JPEG) use PIL, and GeoTIFFs use rasterio.
     """
     if _canonical_sensor(sensor_type) == "IIRS":
         working, _ = load_iirs_working_image(
@@ -1363,13 +1331,29 @@ def load_working_image(
         )
         return working
 
-    # Standard OHRC / TMC-2 single-band path (unchanged)
-    info = inspect_image(data, name)
-    width, height = info["width"], info["height"]
+    # Product inspection
+    info = inspect_image(data, name, metadata=metadata)
+    if info.get("decoding_status") == "PENDING_METADATA":
+        raise ValueError(
+            f"Cannot load working image for '{name}': {info.get('message', 'Metadata dimensions required.')}"
+        )
+
+    width = info.get("width") or 1024
+    height = info.get("height") or 1024
     factor = min(1.0, max_side / max(width, height))
     ow, oh = max(1, int(round(width * factor))), max(1, int(round(height * factor)))
 
-    if is_tiff(name):
+    ptype = classify_product(name)
+
+    if ptype in (ProductType.LRO_PDS3_BINARY, ProductType.CHANDRAYAAN_PDS4_BINARY, ProductType.SCIENTIFIC_BINARY):
+        # Scientific binary: never send to PIL
+        arr, valid, _ = load_scientific_preview(
+            data, name, metadata=metadata or {}, max_side=max_side
+        )
+        if arr.shape != (oh, ow):
+            arr = cv2.resize(arr, (ow, oh), interpolation=cv2.INTER_AREA)
+            valid = cv2.resize(valid.astype(np.uint8), (ow, oh), interpolation=cv2.INTER_NEAREST) > 0
+    elif is_tiff(name):
         with MemoryFile(data) as mem:
             with mem.open() as ds:
                 if not 1 <= band <= ds.count:
@@ -1381,22 +1365,11 @@ def load_working_image(
                 valid = ~np.ma.getmaskarray(image)
                 arr = image.filled(np.nan).astype(np.float32)
     else:
-        try:
-            with Image.open(io.BytesIO(data)) as im:
-                rgba = im.convert("RGBA").resize((ow, oh), Image.Resampling.LANCZOS)
-                valid = np.asarray(rgba.getchannel("A")) > 0
-                arr = np.asarray(rgba.convert("L"), dtype=np.float32)
-        except Exception:
-            # Fallback to scientific binary reader (e.g. raw PDS4/PDS3 .img)
-            arr, valid, _ = read_scientific_binary(
-                data,
-                lines=height if height > 0 else 1024,
-                samples=width if width > 0 else 1024,
-                max_side=max_side,
-            )
-            if arr.shape != (oh, ow):
-                arr = cv2.resize(arr, (ow, oh), interpolation=cv2.INTER_AREA)
-                valid = cv2.resize(valid.astype(np.uint8), (ow, oh), interpolation=cv2.INTER_NEAREST) > 0
+        # Standard image (PNG/JPEG/WebP)
+        with Image.open(io.BytesIO(data)) as im:
+            rgba = im.convert("RGBA").resize((ow, oh), Image.Resampling.LANCZOS)
+            valid = np.asarray(rgba.getchannel("A")) > 0
+            arr = np.asarray(rgba.convert("L"), dtype=np.float32)
 
     gray, mask = normalize_uint8(arr, valid)
     local, structure, gradient = make_representations(gray, mask)
@@ -1985,6 +1958,7 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
             src = load_working_image(
                 source_file.getvalue(), source_file.name, source_band, max_side,
                 sensor_type=source_sensor,
+                metadata=source_metadata,
             )
         if _canonical_sensor(reference_sensor) == "IIRS":
             ref, _iirs_ref_diag = load_iirs_working_image(
@@ -2001,6 +1975,7 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
             ref = load_working_image(
                 reference_file.getvalue(), reference_file.name, reference_band, max_side,
                 sensor_type=reference_sensor,
+                metadata=reference_metadata,
             )
         preprocess_status = "success"
         preprocess_error = None
@@ -2566,31 +2541,8 @@ pair_mode = st.radio(
 )
 is_pair_001 = pair_mode == "Use Demo: PAIR_001"
 
-# Top-level visual pair display card — all values come from actual metadata
-# No hardcoded GSD, scale ratio, or sensor name is shown here.
-_src_gsd_display = "Pending metadata"
-_ref_gsd_display = "Pending metadata"
-_scale_display   = "Scale ratio pending"
-st.markdown(f"""
-<div class="pair-card">
-    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
-        <div style="flex: 1; min-width: 260px; padding: 0.5rem;">
-            <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">SOURCE / MOVING IMAGE</div>
-            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">Chandrayaan-2 Optical</div>
-            <div style="font-size: 0.95rem; color: #94a3b8;">GSD: {_src_gsd_display} &nbsp;•&nbsp; Upload XML for metadata</div>
-        </div>
-        <div style="text-align: center; padding: 0.5rem;">
-            <div style="font-size: 1.05rem; color: #cbd5e1; font-weight: 600;">&#x2193; REGISTER &#x2193;</div>
-            <span class="scale-badge" id="scale-badge-dynamic">{_scale_display}</span>
-        </div>
-        <div style="flex: 1; min-width: 260px; padding: 0.5rem; text-align: right;">
-            <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">REFERENCE / FIXED IMAGE</div>
-            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">Independent Lunar Reference</div>
-            <div style="font-size: 0.95rem; color: #94a3b8;">GSD: {_ref_gsd_display} &nbsp;•&nbsp; Upload LBL or enter metadata</div>
-        </div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+# Top-level visual pair display card placeholder — populated below from canonical metadata
+header_card_placeholder = st.empty()
 
 c1, c2 = st.columns(2)
 with c1:
@@ -3038,6 +2990,32 @@ _scale_ratio_display = scale_ratio_display(src_gsd_val, ref_gsd_val)
 # Legacy shim for downstream code that uses calculate_scale_ratio()
 scale_ratio_val, scale_ratio_str = calculate_scale_ratio(src_gsd_val, ref_gsd_val)
 
+# Render the top header card from the canonical metadata state
+_hdr_src_gsd = f"{src_gsd_val:.4f} m/pixel" if src_gsd_val is not None else "Pending metadata"
+_hdr_ref_gsd = f"{ref_gsd_val:.4f} m/pixel" if ref_gsd_val is not None else "Pending metadata"
+_hdr_scale   = _scale_ratio_display if (src_gsd_val is not None and ref_gsd_val is not None) else "Scale ratio pending"
+
+header_card_placeholder.markdown(f"""
+<div class="pair-card">
+    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 260px; padding: 0.5rem;">
+            <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">SOURCE / MOVING IMAGE</div>
+            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">Chandrayaan-2 Optical</div>
+            <div style="font-size: 0.95rem; color: #94a3b8;">GSD: {_hdr_src_gsd} &nbsp;•&nbsp; {source_status['label']}</div>
+        </div>
+        <div style="text-align: center; padding: 0.5rem;">
+            <div style="font-size: 1.05rem; color: #cbd5e1; font-weight: 600;">&#x2193; REGISTER &#x2193;</div>
+            <span class="scale-badge" id="scale-badge-dynamic">{_hdr_scale}</span>
+        </div>
+        <div style="flex: 1; min-width: 260px; padding: 0.5rem; text-align: right;">
+            <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">REFERENCE / FIXED IMAGE</div>
+            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">Independent Lunar Reference</div>
+            <div style="font-size: 0.95rem; color: #94a3b8;">GSD: {_hdr_ref_gsd} &nbsp;•&nbsp; {reference_status['label']}</div>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
 # Compute explicit state enums
 src_fp_status = compute_footprint_status(source_meta, source_status["enum_status"])
 ref_fp_status = compute_footprint_status(reference_meta, reference_status["enum_status"])
@@ -3153,13 +3131,17 @@ if not (source_file and reference_file):
 
 if source_file and reference_file:
     try:
-        si = inspect_image(source_file.getvalue(), source_file.name)
-        ri = inspect_image(reference_file.getvalue(), reference_file.name)
+        si = inspect_image(source_file.getvalue(), source_file.name, metadata=source_meta)
+        ri = inspect_image(reference_file.getvalue(), reference_file.name, metadata=reference_meta)
         with st.expander("Image metadata (raster inspection)", expanded=False):
+            if ri.get("decoding_status") == "PENDING_METADATA":
+                st.info(f"ℹ️ **Reference Raster:** {ri.get('message')}")
+            if si.get("decoding_status") == "PENDING_METADATA":
+                st.info(f"ℹ️ **Source Raster:** {si.get('message')}")
             st.json({"source": si, "reference": ri})
     except Exception as exc:
-        st.error(f"Could not inspect image: {exc}")
-        st.stop()
+        logger.exception("Image inspection exception")
+        st.warning("Raster inspection requires compatible metadata to decode raw binary geometry.")
 
 with st.expander("Pipeline controls", expanded=True):
     a, b, c = st.columns(3)
@@ -3199,11 +3181,24 @@ scientific_ready = bool(
     and reference_status["status"] not in {"INCOMPLETE", "NOT_PROVIDED"}
     and footprint_eval.get("has_overlap") is True
 )
-image_only_ready = bool(source_file and reference_file)
+
+ref_ptype = classify_product(reference_file.name if reference_file else "")
+ref_is_science_binary = ref_ptype in (
+    ProductType.LRO_PDS3_BINARY, ProductType.CHANDRAYAAN_PDS4_BINARY, ProductType.SCIENTIFIC_BINARY
+)
+ref_can_decode = not ref_is_science_binary or bool(reference_meta.get("dimensions", {}).get("lines"))
+image_only_ready = bool(source_file and reference_file and ref_can_decode)
+
 if execution_mode == "Scientific / validated mode" and not scientific_ready:
     st.error("RUN BLOCKED: Scientific mode requires source/reference metadata and confirmed geographic overlap.")
-elif execution_mode == "Experimental image-only mode" and image_only_ready:
-    st.warning("EXPERIMENTAL - NO GEOGRAPHIC VALIDATION")
+elif execution_mode == "Experimental image-only mode":
+    if not ref_can_decode:
+        st.warning(
+            "RUN BLOCKED: Reference is a scientific binary raster (.IMG). "
+            "Raster decoding requires lines/samples dimensions. Upload a label or enter dimensions in the manual entry form."
+        )
+    elif image_only_ready:
+        st.warning("EXPERIMENTAL - NO GEOGRAPHIC VALIDATION")
 
 run = st.button(
     "🚀 Run LunaMatch V3",
