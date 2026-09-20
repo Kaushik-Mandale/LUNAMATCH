@@ -19,6 +19,29 @@ from rasterio.io import MemoryFile
 
 import loftr_matcher
 import iirs_preprocessing
+from core.data_models import (
+    PAIR_001_CONFIG,
+    PAIR_001_SOURCE,
+    PAIR_001_REFERENCE,
+    calculate_scale_ratio,
+    ImageMetadataRecord,
+    FootprintCoordinates,
+)
+from core.pds_parser import parse_lro_pds3_label, read_scientific_binary
+from core.footprint import evaluate_footprint_overlap, extract_overlap_rois, compute_overlap_pixel_roi
+from core.spatial import balance_correspondences_spatially
+from core.registration import (
+    create_alpha_overlay,
+    create_checkerboard_comparison,
+    draw_inlier_outlier_matches,
+    warp_source_to_reference,
+)
+from core.evaluation import (
+    compute_reprojection_rmse,
+    compile_evaluation_report,
+    build_method_comparison_table,
+)
+from experiments.manager import ExperimentManager
 
 logger = logging.getLogger("lunamatch_v3")
 
@@ -40,37 +63,76 @@ st.markdown("""
         font-size: 1.35rem;
         font-weight: 600;
     }
+    .pair-card {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+    }
+    .scale-badge {
+        background: #1e3a8a;
+        color: #93c5fd;
+        padding: 0.2rem 0.6rem;
+        border-radius: 4px;
+        font-weight: 600;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-SENSORS = ["OHRC", "TMC", "IIRS", "Unknown"]
-SENSORS_UI = ["Auto Detect", "OHRC", "TMC-2", "IIRS"]
+SENSORS = ["OHRC", "TMC", "IIRS", "LROC_NAC", "Unknown"]
+SENSORS_UI = ["Auto Detect", "OHRC", "TMC-2", "IIRS", "LROC NAC"]
 
-# Canonical sensor token for 'TMC-2' UI label (both map to same routing token)
+SOURCE_MISSIONS = ["Chandrayaan-2"]
+SOURCE_SENSORS_UI = ["OHRC", "TMC-2", "IIRS", "Auto Detect"]
+
+REFERENCE_MISSIONS = [
+    "Lunar Reconnaissance Orbiter (LRO)",
+    "SELENE (Kaguya)",
+    "Other Lunar Reference",
+    "Chandrayaan-2 (Cross-Sensor Testing)",
+]
+REFERENCE_SENSORS_UI = [
+    "LROC NAC",
+    "Terrain Camera (TC)",
+    "Multiband Imager (MI)",
+    "Other Lunar Reference",
+    "Auto Detect",
+    "OHRC",
+    "TMC-2",
+    "IIRS",
+]
+
+# Canonical sensor tokens
 _TMC_TOKENS = {"TMC", "TMC-2", "TMC2"}
+_LRO_TOKENS = {"LRO", "LROC", "LROC NAC", "LROC_NAC", "NAC", "LRO / LROC NAC"}
 
 
 def _canonical_sensor(sensor_ui: str) -> str:
     """Normalise UI sensor label to the canonical pipeline token.
 
     - 'TMC-2' -> 'TMC'  (keeps test contracts that compare against 'TMC')
+    - 'LROC NAC' / 'LRO' -> 'LROC_NAC'
     - 'Auto Detect' -> 'Unknown' (resolved later from metadata / filename)
     - Everything else is returned as-is.
     """
     s = (sensor_ui or "").strip().upper()
     if s in {"TMC-2", "TMC2"}:
         return "TMC"
+    if s in {"LROC NAC", "LROC_NAC", "NAC", "LRO", "LRO / LROC NAC", "LUNAR RECONNAISSANCE ORBITER"}:
+        return "LROC_NAC"
     if s == "AUTO DETECT":
         return "Unknown"
     return s if s else "Unknown"
 
 
 def detect_sensor_from_filename(name: str) -> str:
-    """Infer Chandrayaan-2 sensor from product filename patterns.
+    """Infer sensor from product filename patterns.
 
     ch2_iir* -> 'IIRS'
     ch2_ohr* -> 'OHRC'
     ch2_tmc* -> 'TMC'
+    m1* / nac* / lro* -> 'LROC_NAC'
     Returns 'Unknown' when no pattern matches.
     """
     lname = (name or "").lower()
@@ -80,6 +142,8 @@ def detect_sensor_from_filename(name: str) -> str:
         return "OHRC"
     if "ch2_tmc" in lname or "tmc" in lname:
         return "TMC"
+    if "m1" in lname or "nac" in lname or "lro" in lname or "lroc" in lname:
+        return "LROC_NAC"
     return "Unknown"
 
 
@@ -1030,7 +1094,10 @@ def parse_chandrayaan2_pds4_xml(data: bytes | str, name: str = "") -> dict:
 
 
 def parse_metadata_xml(data: bytes | str, name: str = "") -> dict:
-    """Wrapper that delegates directly to the canonical PDS4 parser."""
+    """Wrapper that delegates to PDS3 or PDS4 parser based on content."""
+    sample = (data[:2000].decode("ascii", errors="replace") if isinstance(data, bytes) else str(data)[:2000]).lower()
+    if "pds_version_id" in sample or "record_type" in sample or "lroc" in sample or ("lines" in sample and "^image" in sample):
+        return parse_lro_pds3_label(data, name)
     return parse_chandrayaan2_pds4_xml(data, name)
 
 
@@ -1288,10 +1355,22 @@ def load_working_image(
                 valid = ~np.ma.getmaskarray(image)
                 arr = image.filled(np.nan).astype(np.float32)
     else:
-        with Image.open(io.BytesIO(data)) as im:
-            rgba = im.convert("RGBA").resize((ow, oh), Image.Resampling.LANCZOS)
-            valid = np.asarray(rgba.getchannel("A")) > 0
-            arr = np.asarray(rgba.convert("L"), dtype=np.float32)
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                rgba = im.convert("RGBA").resize((ow, oh), Image.Resampling.LANCZOS)
+                valid = np.asarray(rgba.getchannel("A")) > 0
+                arr = np.asarray(rgba.convert("L"), dtype=np.float32)
+        except Exception:
+            # Fallback to scientific binary reader (e.g. raw PDS4/PDS3 .img)
+            arr, valid, _ = read_scientific_binary(
+                data,
+                lines=height if height > 0 else 1024,
+                samples=width if width > 0 else 1024,
+                max_side=max_side,
+            )
+            if arr.shape != (oh, ow):
+                arr = cv2.resize(arr, (ow, oh), interpolation=cv2.INTER_AREA)
+                valid = cv2.resize(valid.astype(np.uint8), (ow, oh), interpolation=cv2.INTER_NEAREST) > 0
 
     gray, mask = normalize_uint8(arr, valid)
     local, structure, gradient = make_representations(gray, mask)
@@ -2445,25 +2524,64 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
 
 # ---------------- UI ----------------
 st.title("🌙 LunaMatch V3")
-st.caption("Sensor-aware • multi-scale-ready • multi-representation • hybrid matching • robust geometry • validation • refinement")
+st.caption("Multi-modal, Sun angle and scale invariant image correspondence using Chandrayaan-2 optical images (SIH26166 • ISRO)")
 st.info("Research pipeline by Team Akatsuki. Low residuals are not, by themselves, proof of sub-pixel scientific accuracy.")
+
+# --- EXPERIMENT CONFIGURATION SELECTOR ---
+pair_mode = st.radio(
+    "Experiment Configuration",
+    [
+        "PAIR_001: Chandrayaan-2 OHRC → LRO LROC NAC (Scale Difference ≈ 7.8×)",
+        "Custom Pair / Interactive Upload",
+    ],
+    index=0,
+    horizontal=True,
+    help="Select PAIR_001 for the primary real-world cross-mission experiment, or choose Custom Pair to configure manually.",
+)
+is_pair_001 = "PAIR_001" in pair_mode
+
+# Top-level visual pair display card
+st.markdown("""
+<div class="pair-card">
+    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 260px; padding: 0.5rem;">
+            <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">SOURCE / MOVING IMAGE</div>
+            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">Chandrayaan-2 OHRC</div>
+            <div style="font-size: 0.95rem; color: #38bdf8;">~0.24 m/pixel &nbsp;•&nbsp; Calibrated</div>
+        </div>
+        <div style="text-align: center; padding: 0.5rem;">
+            <div style="font-size: 1.05rem; color: #cbd5e1; font-weight: 600;">↓ REGISTER ↓</div>
+            <span class="scale-badge">Scale Difference ≈ 7.8×</span>
+        </div>
+        <div style="flex: 1; min-width: 260px; padding: 0.5rem; text-align: right;">
+            <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">REFERENCE / FIXED IMAGE</div>
+            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">LRO LROC NAC</div>
+            <div style="font-size: 0.95rem; color: #38bdf8;">~1.8669 m/pixel &nbsp;•&nbsp; EDR</div>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 c1, c2 = st.columns(2)
 with c1:
+    st.markdown("#### 🛰️ SOURCE / MOVING")
+    source_mission = st.selectbox("Source Mission", SOURCE_MISSIONS, index=0)
     source_sensor_ui = st.selectbox(
-        "Source sensor", SENSORS_UI, index=0,
-        help="Select 'Auto Detect' to infer sensor from filename. Choose 'IIRS' for Chandrayaan-2 Imaging Infrared Spectrometer."
+        "Source Instrument / Sensor", SOURCE_SENSORS_UI, index=0 if is_pair_001 else 0,
+        help="Select Chandrayaan-2 instrument: OHRC, TMC-2, or IIRS."
     )
     source_file = st.file_uploader(
-        "Upload source image", type=["tif", "tiff", "png", "jpg", "jpeg", "npy"], key="source"
+        "Upload source image", type=["tif", "tiff", "png", "jpg", "jpeg", "npy", "img", "raw", "dat"], key="source"
     )
 with c2:
+    st.markdown("#### 🗺️ REFERENCE / FIXED")
+    reference_mission = st.selectbox("Reference Mission", REFERENCE_MISSIONS, index=0 if is_pair_001 else 0)
     reference_sensor_ui = st.selectbox(
-        "Reference sensor", SENSORS_UI, index=1,
-        help="Select 'Auto Detect' to infer sensor from filename."
+        "Reference Instrument / Sensor", REFERENCE_SENSORS_UI, index=0 if is_pair_001 else 0,
+        help="Select independent lunar reference instrument (e.g. LROC NAC, SELENE TC/MI)."
     )
     reference_file = st.file_uploader(
-        "Upload reference image", type=["tif", "tiff", "png", "jpg", "jpeg", "npy"], key="reference"
+        "Upload reference image", type=["tif", "tiff", "png", "jpg", "jpeg", "npy", "img", "raw", "dat"], key="reference"
     )
 
 # Resolve canonical sensor tokens
@@ -2597,10 +2715,13 @@ with metadata_expander:
             print("SOURCE PARSED METADATA\n", json.dumps(source_meta, indent=2, default=str))
             print("SOURCE VALIDATION:\n", source_meta.get("validation_errors", []))
             print("source XML byte length:", len(source_xml_bytes))
+        elif is_pair_001:
+            source_meta = PAIR_001_SOURCE.to_canonical_dict()
+            st.caption("Auto-configured from PAIR_001 demo specification (Chandrayaan-2 OHRC Calibrated)")
         else:
             source_meta = empty_metadata_template()
 
-        if source_meta_file is not None:
+        if source_meta_file is not None or is_pair_001:
             if source_meta.get("valid"):
                 st.success("✓ Valid source metadata")
             else:
@@ -2644,18 +2765,21 @@ with metadata_expander:
 
     with md_ref_col:
         st.markdown("### Reference / Fixed Image Metadata")
-        reference_meta_file = st.file_uploader("Upload reference metadata/XML", type=["xml", "txt"], key="reference_meta_xml")
+        reference_meta_file = st.file_uploader("Upload reference metadata/XML/LBL", type=["xml", "txt", "lbl"], key="reference_meta_xml")
         if reference_meta_file is not None:
             reference_xml_bytes = reference_meta_file.getvalue()
-            reference_meta = parse_chandrayaan2_pds4_xml(reference_xml_bytes, reference_meta_file.name)
-            st.caption(f"XML: **{reference_meta_file.name}** ({len(reference_xml_bytes)} bytes)")
+            reference_meta = parse_metadata_xml(reference_xml_bytes, reference_meta_file.name)
+            st.caption(f"Label: **{reference_meta_file.name}** ({len(reference_xml_bytes)} bytes)")
             print("REFERENCE PARSED METADATA\n", json.dumps(reference_meta, indent=2, default=str))
             print("REFERENCE VALIDATION:\n", reference_meta.get("validation_errors", []))
             print("reference XML byte length:", len(reference_xml_bytes))
+        elif is_pair_001:
+            reference_meta = PAIR_001_REFERENCE.to_canonical_dict()
+            st.caption("Auto-configured from PAIR_001 demo specification (LRO LROC NAC EDR)")
         else:
             reference_meta = empty_metadata_template()
 
-        if reference_meta_file is not None:
+        if reference_meta_file is not None or is_pair_001:
             if reference_meta.get("valid"):
                 st.success("✓ Valid reference metadata")
             else:
@@ -2695,7 +2819,82 @@ with metadata_expander:
             with st.expander("Canonical Parsed Dictionary (Reference)", expanded=False):
                 st.json(reference_meta)
         else:
-            st.info("Upload reference Chandrayaan-2 PDS4 XML to populate metadata.")
+            st.info("Upload reference metadata/label to populate metadata.")
+
+# ──────────────────────────────────────────────────────
+# PAIR VALIDATION & SCIENTIFIC SUMMARY GATE
+# ──────────────────────────────────────────────────────
+footprint_eval = evaluate_footprint_overlap(source_meta, reference_meta)
+src_gsd_val = source_meta.get("gsd_m_per_pixel") or (0.24 if is_pair_001 else None)
+ref_gsd_val = reference_meta.get("gsd_m_per_pixel") or (1.8669 if is_pair_001 else None)
+scale_ratio_val, scale_ratio_str = calculate_scale_ratio(src_gsd_val, ref_gsd_val)
+
+# Pair Validation Card
+st.markdown("#### 🔬 Pair Validation Gate")
+val_c1, val_c2, val_c3 = st.columns(3)
+with val_c1:
+    if footprint_eval["has_overlap"] is True:
+        st.success("✓ Geographic footprint overlap confirmed")
+    elif footprint_eval["has_overlap"] is False:
+        st.error("✕ No meaningful geographic overlap detected")
+    else:
+        st.info("ℹ️ Footprint overlap: Coordinates pending")
+
+    if source_meta.get("valid"):
+        st.success(f"✓ Source metadata: {source_meta.get('mission', 'Chandrayaan-2')} {source_meta.get('sensor_type', '')}")
+    else:
+        st.warning("⚠️ Source metadata incomplete")
+
+with val_c2:
+    if reference_meta.get("valid"):
+        st.success(f"✓ Reference metadata: {reference_meta.get('mission', 'Lunar Ref')} {reference_meta.get('sensor_type', '')}")
+    else:
+        st.warning("⚠️ Reference metadata incomplete")
+
+    if scale_ratio_val is not None:
+        st.success(f"✓ {scale_ratio_str}")
+    else:
+        st.info("ℹ️ Scale ratio: GSD pending")
+
+with val_c3:
+    is_cross_sensor = classify_sensor_path(source_sensor, reference_sensor) == "different"
+    st.info(f"✓ Mode: {'Cross-Mission / Cross-Sensor' if is_cross_sensor else 'Same-Sensor Modality'}")
+
+    has_files = (source_file is not None and reference_file is not None)
+    if not has_files:
+        st.warning("⚠️ Pending image file upload")
+    elif not footprint_eval["gate_passed"]:
+        st.error("✕ Pipeline halted by geographic gate")
+    else:
+        st.success("✓ Ready for matching execution")
+
+# Scientific Pair Summary
+with st.expander("📊 Scientific Pair Summary (Metadata vs Derived Parameters)", expanded=False):
+    s_col_meta, s_col_derived = st.columns(2)
+    with s_col_meta:
+        st.markdown("##### AVAILABLE METADATA")
+        st.markdown(f"- **Source Product ID:** `{source_meta.get('product_id') or (PAIR_001_SOURCE.product_id if is_pair_001 else '—')}`")
+        st.markdown(f"- **Reference Product ID:** `{reference_meta.get('product_id') or (PAIR_001_REFERENCE.product_id if is_pair_001 else '—')}`")
+        st.markdown(f"- **Source Resolution (GSD):** `{src_gsd_val if src_gsd_val is not None else '—'} m/pixel`")
+        st.markdown(f"- **Reference Resolution (GSD):** `{ref_gsd_val if ref_gsd_val is not None else '—'} m/pixel`")
+        st.markdown(f"- **Source Calibration:** `{source_meta.get('processing_level', 'Calibrated')}`")
+        st.markdown(f"- **Reference State:** `{reference_meta.get('processing_level', 'EDR')}`")
+        st.markdown(f"- **Source Sun Geometry:** Azimuth: `{source_meta.get('sun_azimuth_deg', '—')}°`, Elevation: `{source_meta.get('sun_elevation_deg', '—')}°`")
+        st.markdown(f"- **Reference Sun Geometry:** Azimuth: `{reference_meta.get('sun_azimuth_deg', '—')}°`, Elevation: `{reference_meta.get('sun_elevation_deg', '—')}°`")
+    with s_col_derived:
+        st.markdown("##### DERIVED PARAMETERS")
+        st.markdown(f"- **Scale Difference:** `{scale_ratio_str}`")
+        st.markdown(f"- **Estimated Overlap Area:** `{footprint_eval.get('overlap_area_sq_deg', 0.0):.4f} sq. deg`")
+        if source_meta.get("sun_elevation_deg") is not None and reference_meta.get("sun_elevation_deg") is not None:
+            el_diff = abs(float(source_meta["sun_elevation_deg"]) - float(reference_meta["sun_elevation_deg"]))
+            st.markdown(f"- **Potential Illumination (Elevation) Difference:** `~{el_diff:.2f}°`")
+        else:
+            st.markdown("- **Potential Illumination Difference:** `Derived when sun angles available`")
+        st.markdown(f"- **Sensor Domain Relation:** `{'Cross-Mission (Chandrayaan-2 → Lunar Reference)' if is_cross_sensor else 'Same Sensor'}`")
+        st.markdown(f"- **Overlap Gate Status:** `{'PASSED' if footprint_eval['gate_passed'] else 'REJECTED'}`")
+
+if not (source_file and reference_file):
+    st.info("ℹ️ **Metadata pair configured.** Upload/select the actual product files to execute processing.")
 
 if source_file and reference_file:
     try:
@@ -2711,7 +2910,7 @@ with st.expander("Pipeline controls", expanded=True):
     a, b, c = st.columns(3)
     with a:
         source_band = st.number_input("Source band", min_value=1, value=1, step=1)
-        max_side = st.select_slider("Maximum processing side", [1024, 1600, 2048, 3072, 4096], value=2048)
+        max_side = st.select_slider("Maximum processing side (PROCESSING LIMIT)", [1024, 1600, 2048, 3072, 4096], value=2048, help="Processing limit for memory-safe feature extraction; scientific source data remains untouched.")
         if source_sensor == reference_sensor:
             feature_count = st.slider("SIFT features / representation", 3000, 30000, 12000, 1000)
             loftr_confidence_threshold = 0.35
@@ -2907,6 +3106,19 @@ if result:
             st.image(ref_disp, use_container_width=True)
             st.caption(f"Preview: {ref_diag['shape'][1]}×{ref_diag['shape'][0]} px | Full Resolution: {result['reference'].info.get('width')}×{result['reference'].info.get('height')} px")
 
+        # Overlap ROI Display
+        st.markdown("#### Geographic Overlap Region of Interest (ROI)")
+        src_roi, ref_roi, roi_info = extract_overlap_rois(result["source"].gray, result["reference"].gray, source_meta, reference_meta)
+        roi_col1, roi_col2 = st.columns(2)
+        with roi_col1:
+            st.markdown("**Source Overlap ROI**")
+            src_roi_disp, _ = make_display_preview(src_roi, max_dim=500)
+            st.image(src_roi_disp, use_container_width=True, caption=f"Source Overlap Region ({src_roi.shape[1]}×{src_roi.shape[0]} px)")
+        with roi_col2:
+            st.markdown("**Reference Overlap ROI**")
+            ref_roi_disp, _ = make_display_preview(ref_roi, max_dim=500)
+            st.image(ref_roi_disp, use_container_width=True, caption=f"Reference Overlap Region ({ref_roi.shape[1]}×{ref_roi.shape[0]} px)")
+
         # Registered Result Prominently Displayed
         st.markdown("#### REGISTERED IMAGE")
         reg_disp, reg_diag = make_display_preview(result["registered"], max_dim=900)
@@ -2943,11 +3155,17 @@ if result:
     # --- TAB 3: REGISTRATION ---
     with tab_reg:
         st.markdown("### Image Registration & Alignment Verification")
+        st.caption("Direction: **Source → Reference Registration** (Source / Moving transformed into Reference / Fixed frame)")
+
+        # Interactive Alpha Slider
+        alpha_val = st.slider("Alpha Overlay Blend (Registered Source %)", 0.0, 1.0, 0.50, 0.05)
+        live_overlay = create_alpha_overlay(result["reference"].gray, result["registered"], result["validity"], alpha=alpha_val)
+
         r_c1, r_c2 = st.columns(2)
         with r_c1:
-            st.markdown("**50/50 Reference + Registered Source Overlay**")
-            ov_disp, ov_diag = make_display_preview(result["overlay"], max_dim=800, is_bgr=True)
-            st.image(ov_disp, use_container_width=True, caption="50/50 reference + registered source overlay")
+            st.markdown(f"**{int((1-alpha_val)*100)}/{int(alpha_val*100)} Reference + Registered Source Overlay**")
+            ov_disp, ov_diag = make_display_preview(live_overlay, max_dim=800, is_bgr=True)
+            st.image(ov_disp, use_container_width=True, caption=f"Alpha overlay (alpha={alpha_val:.2f})")
         with r_c2:
             st.markdown(f"**Registered Source Image ({selected_model})**")
             st.image(reg_disp, use_container_width=True, caption=f"Warped source image aligned to reference frame ({actual_gv})")
@@ -2955,6 +3173,13 @@ if result:
                 st.markdown("**After Smooth Residual Correction**")
                 corr_disp_img, _ = make_display_preview(result["corrected"], max_dim=800)
                 st.image(corr_disp_img, use_container_width=True, caption="Smooth residual field correction")
+
+        # Checkerboard Comparison
+        st.markdown("#### 🏁 Diagnostic Checkerboard Comparison")
+        tile_sz = st.slider("Checkerboard Tile Size (px)", 16, 128, 64, 16)
+        checkerboard_img = create_checkerboard_comparison(result["reference"].gray, result["registered"], tile_size=tile_sz)
+        cb_disp, _ = make_display_preview(checkerboard_img, max_dim=850, is_bgr=True)
+        st.image(cb_disp, use_container_width=True, caption=f"Checkerboard alignment ({tile_sz}×{tile_sz} px tiles): Alternating Reference and Registered Source")
 
         with st.expander("Registered Image Diagnostics", expanded=False):
             st.json({
@@ -3052,6 +3277,32 @@ if result:
         d2.download_button("Validity mask", png_bytes(result["validity"]), "lunamatch_validity.png", "image/png")
         d3.download_button("Correspondences CSV", result["matches"].to_csv(index=False).encode(), "lunamatch_correspondences.csv", "text/csv")
         d4.download_button("Research report JSON", json.dumps(report, indent=2).encode(), "lunamatch_report.json", "application/json")
+
+        st.markdown("#### Experiment Persistence")
+        if st.button("💾 Save Experiment Record (PAIR_001)", type="secondary"):
+            try:
+                exp_mgr = ExperimentManager()
+                saved_dir = exp_mgr.save_experiment(
+                    pair_id="PAIR_001",
+                    source_meta=source_meta,
+                    reference_meta=reference_meta,
+                    config={
+                        "model": selected_model,
+                        "verifier": actual_gv,
+                        "max_side": max_side,
+                        "grid_size": grid_size,
+                        "cell_limit": cell_limit,
+                        "subpixel": subpixel,
+                    },
+                    metrics=report,
+                    source_preview=result["source"].gray,
+                    reference_preview=result["reference"].gray,
+                    registered_img=result["registered"],
+                    correspondence_img=result["correspondence"],
+                )
+                st.success(f"✓ Experiment record saved to `{saved_dir}`")
+            except Exception as exp_save_err:
+                st.error(f"Failed to save experiment: {exp_save_err}")
 
     # ==================================================
     # 6. TECHNICAL PIPELINE DETAILS (COLLAPSED AT BOTTOM)
