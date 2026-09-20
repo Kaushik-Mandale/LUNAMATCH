@@ -41,6 +41,19 @@ from core.evaluation import (
     compile_evaluation_report,
     build_method_comparison_table,
 )
+from core.product_state import (
+    MetadataStatus,
+    FootprintStatus,
+    PairValidationStatus,
+    METADATA_STATUS_LABELS,
+    FOOTPRINT_STATUS_LABELS,
+    PAIR_STATUS_LABELS,
+    compute_file_hash,
+    compute_metadata_status,
+    compute_footprint_status,
+    compute_pair_validation,
+    scale_ratio_display,
+)
 from experiments.manager import ExperimentManager
 
 logger = logging.getLogger("lunamatch_v3")
@@ -145,6 +158,39 @@ def detect_sensor_from_filename(name: str) -> str:
     if "m1" in lname or "nac" in lname or "lro" in lname or "lroc" in lname:
         return "LROC_NAC"
     return "Unknown"
+
+
+def classify_product_file(name: str) -> str:
+    """Classify an uploaded file without treating a preview as science data."""
+    lname = (name or "").lower()
+    if lname.endswith((".xml", ".lbl", ".txt")):
+        return "METADATA LABEL"
+    if "_brw_" in lname or "browse" in lname or "preview" in lname:
+        return "BROWSE / PREVIEW IMAGE"
+    if "_d_img_" in lname or lname.endswith((".img", ".raw", ".dat")):
+        return "SCIENTIFIC IMAGE PRODUCT"
+    if lname.endswith((".png", ".jpg", ".jpeg")):
+        return "BROWSE / PREVIEW IMAGE"
+    return "IMAGE PRODUCT"
+
+
+def metadata_status(meta: dict, source: str) -> dict:
+    """Return an explicit metadata lifecycle state dict for UI and gating.
+
+    Uses the MetadataStatus enum for reliable status comparisons.
+    """
+    enum_status = compute_metadata_status(meta, source)
+    icon, label, detail = METADATA_STATUS_LABELS.get(
+        enum_status, ("?", str(enum_status.value), "")
+    )
+    return {
+        "status":      enum_status.value,  # string for legacy dict-key comparisons
+        "enum_status": enum_status,
+        "source":      source,
+        "label":       label,
+        "icon":        icon,
+        "detail":      detail,
+    }
 
 
 
@@ -254,28 +300,8 @@ def _valid_corner_footprint(footprint: dict) -> bool:
 
 
 def geographic_overlap(source_meta: dict, reference_meta: dict) -> dict:
-    """Check bbox intersection from metadata footprints without image matching."""
-    def bounds(meta):
-        fp = meta.get("footprint") if isinstance(meta, dict) else None
-        if not _valid_corner_footprint(fp):
-            return None
-        latitudes = [fp[name][0] for name in ("upper_left", "upper_right", "lower_left", "lower_right")]
-        longitudes = [fp[name][1] for name in ("upper_left", "upper_right", "lower_left", "lower_right")]
-        return min(latitudes), max(latitudes), min(longitudes), max(longitudes)
-
-    source_bounds = bounds(source_meta)
-    reference_bounds = bounds(reference_meta)
-    if source_bounds is None or reference_bounds is None:
-        return {"available": False, "overlap": None, "source_bounds": source_bounds, "reference_bounds": reference_bounds}
-
-    lat_overlap = min(source_bounds[1], reference_bounds[1]) - max(source_bounds[0], reference_bounds[0])
-    lon_overlap = min(source_bounds[3], reference_bounds[3]) - max(source_bounds[2], reference_bounds[2])
-    return {
-        "available": True,
-        "overlap": lat_overlap > 0 and lon_overlap > 0,
-        "source_bounds": source_bounds,
-        "reference_bounds": reference_bounds,
-    }
+    """Compatibility wrapper around the canonical wrap-aware validator."""
+    return evaluate_footprint_overlap(source_meta, reference_meta)
 def _find_elem(root, ns_paths: list, local_names: list | None = None):
     for path in ns_paths:
         try:
@@ -2531,32 +2557,36 @@ st.info("Research pipeline by Team Akatsuki. Low residuals are not, by themselve
 pair_mode = st.radio(
     "Experiment Configuration",
     [
-        "PAIR_001: Chandrayaan-2 OHRC → LRO LROC NAC (Scale Difference ≈ 7.8×)",
-        "Custom Pair / Interactive Upload",
+        "Real data / Interactive Upload",
+        "Use Demo: PAIR_001",
     ],
     index=0,
     horizontal=True,
     help="Select PAIR_001 for the primary real-world cross-mission experiment, or choose Custom Pair to configure manually.",
 )
-is_pair_001 = "PAIR_001" in pair_mode
+is_pair_001 = pair_mode == "Use Demo: PAIR_001"
 
-# Top-level visual pair display card
-st.markdown("""
+# Top-level visual pair display card — all values come from actual metadata
+# No hardcoded GSD, scale ratio, or sensor name is shown here.
+_src_gsd_display = "Pending metadata"
+_ref_gsd_display = "Pending metadata"
+_scale_display   = "Scale ratio pending"
+st.markdown(f"""
 <div class="pair-card">
     <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
         <div style="flex: 1; min-width: 260px; padding: 0.5rem;">
             <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">SOURCE / MOVING IMAGE</div>
-            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">Chandrayaan-2 OHRC</div>
-            <div style="font-size: 0.95rem; color: #38bdf8;">~0.24 m/pixel &nbsp;•&nbsp; Calibrated</div>
+            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">Chandrayaan-2 Optical</div>
+            <div style="font-size: 0.95rem; color: #94a3b8;">GSD: {_src_gsd_display} &nbsp;•&nbsp; Upload XML for metadata</div>
         </div>
         <div style="text-align: center; padding: 0.5rem;">
-            <div style="font-size: 1.05rem; color: #cbd5e1; font-weight: 600;">↓ REGISTER ↓</div>
-            <span class="scale-badge">Scale Difference ≈ 7.8×</span>
+            <div style="font-size: 1.05rem; color: #cbd5e1; font-weight: 600;">&#x2193; REGISTER &#x2193;</div>
+            <span class="scale-badge" id="scale-badge-dynamic">{_scale_display}</span>
         </div>
         <div style="flex: 1; min-width: 260px; padding: 0.5rem; text-align: right;">
             <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">REFERENCE / FIXED IMAGE</div>
-            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">LRO LROC NAC</div>
-            <div style="font-size: 0.95rem; color: #38bdf8;">~1.8669 m/pixel &nbsp;•&nbsp; EDR</div>
+            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc;">Independent Lunar Reference</div>
+            <div style="font-size: 0.95rem; color: #94a3b8;">GSD: {_ref_gsd_display} &nbsp;•&nbsp; Upload LBL or enter metadata</div>
         </div>
     </div>
 </div>
@@ -2583,6 +2613,13 @@ with c2:
     reference_file = st.file_uploader(
         "Upload reference image", type=["tif", "tiff", "png", "jpg", "jpeg", "npy", "img", "raw", "dat"], key="reference"
     )
+
+if source_file is not None:
+    st.caption(f"Source product: **{classify_product_file(source_file.name)}** | {len(source_file.getvalue()) / (1024 ** 2):.1f} MB")
+    if classify_product_file(source_file.name) == "BROWSE / PREVIEW IMAGE":
+        st.warning("Browse/preview image selected. Scientific source product required for full-resolution processing.")
+if reference_file is not None:
+    st.caption(f"Reference product: **{classify_product_file(reference_file.name)}** | {len(reference_file.getvalue()) / (1024 ** 2):.1f} MB")
 
 # Resolve canonical sensor tokens
 _src_sensor_raw = _canonical_sensor(source_sensor_ui)
@@ -2702,6 +2739,31 @@ if _any_iirs:
                 st.warning(f"Preview not available: {_rprev_exc}")
 
 
+# ── File-hash-based session state invalidation ──────────────────────────────
+# When the uploaded file changes, we must discard stale metadata and results.
+_src_hash_now = compute_file_hash(source_file.getvalue()) if source_file else None
+_ref_hash_now = compute_file_hash(reference_file.getvalue()) if reference_file else None
+
+# If source file changed, clear stale source state
+if _src_hash_now and st.session_state.get("_src_file_hash") != _src_hash_now:
+    for _k in ("_src_meta", "_src_meta_source", "result", "comp_result"):
+        st.session_state.pop(_k, None)
+    st.session_state["_src_file_hash"] = _src_hash_now
+
+# If reference file changed, clear stale reference state and results
+if _ref_hash_now and st.session_state.get("_ref_file_hash") != _ref_hash_now:
+    for _k in ("_ref_meta", "_ref_meta_source", "_ref_manual_meta", "result", "comp_result"):
+        st.session_state.pop(_k, None)
+    st.session_state["_ref_file_hash"] = _ref_hash_now
+
+# If either file was removed, clear the corresponding state
+if _src_hash_now is None and st.session_state.get("_src_file_hash"):
+    for _k in ("_src_meta", "_src_meta_source", "_src_file_hash", "result", "comp_result"):
+        st.session_state.pop(_k, None)
+if _ref_hash_now is None and st.session_state.get("_ref_file_hash"):
+    for _k in ("_ref_meta", "_ref_meta_source", "_ref_manual_meta", "_ref_file_hash", "result", "comp_result"):
+        st.session_state.pop(_k, None)
+
 metadata_expander = st.expander("IMAGE METADATA", expanded=True)
 with metadata_expander:
     md_source_col, md_ref_col = st.columns(2)
@@ -2711,187 +2773,380 @@ with metadata_expander:
         if source_meta_file is not None:
             source_xml_bytes = source_meta_file.getvalue()
             source_meta = parse_chandrayaan2_pds4_xml(source_xml_bytes, source_meta_file.name)
-            st.caption(f"XML: **{source_meta_file.name}** ({len(source_xml_bytes)} bytes)")
-            print("SOURCE PARSED METADATA\n", json.dumps(source_meta, indent=2, default=str))
-            print("SOURCE VALIDATION:\n", source_meta.get("validation_errors", []))
-            print("source XML byte length:", len(source_xml_bytes))
+            st.caption(f"XML: **{source_meta_file.name}** ({len(source_xml_bytes):,} bytes)")
+            source_meta_source = "PARSED_FROM_PRODUCT"
         elif is_pair_001:
+            # DEMO MODE: explicit user selection only
             source_meta = PAIR_001_SOURCE.to_canonical_dict()
-            st.caption("Auto-configured from PAIR_001 demo specification (Chandrayaan-2 OHRC Calibrated)")
+            st.caption("🔵 Demo metadata loaded by explicit DEMO MODE selection.")
+            source_meta_source = "DEMO"
         else:
+            # REAL MODE with no XML uploaded — never use demo values
             source_meta = empty_metadata_template()
+            source_meta_source = "NOT_PROVIDED"
 
-        if source_meta_file is not None or is_pair_001:
-            if source_meta.get("valid"):
-                st.success("✓ Valid source metadata")
-            else:
-                err_msg = ", ".join(source_meta.get("validation_errors", []))
-                st.error(f"✕ Invalid source metadata: {err_msg}")
-            for warning in source_meta.get("validation_warnings", []):
-                st.warning(warning)
+        source_status = metadata_status(source_meta, source_meta_source)
+        _src_icon   = source_status["icon"]
+        _src_label  = source_status["label"]
+        _src_detail = source_status["detail"]
 
+        if source_meta_source == "NOT_PROVIDED":
+            st.info(f"Upload source Chandrayaan-2 PDS4 XML to populate metadata.")
+        elif source_status["enum_status"] == MetadataStatus.DEMO:
+            st.info(f"🔵 **Demo metadata** — not a real uploaded product.")
+        elif source_status["enum_status"] in (MetadataStatus.INCOMPLETE, MetadataStatus.INVALID):
+            err_msg = "; ".join(source_meta.get("validation_errors", ["Incomplete"]))
+            st.warning(f"{_src_icon} Source metadata incomplete: {err_msg}")
+        else:
+            st.success(f"{_src_icon} Source metadata available ({_src_label})")
+
+        for warning in source_meta.get("validation_warnings", []):
+            st.warning(warning)
+
+        if source_meta_source != "NOT_PROVIDED":
             s_col1, s_col2 = st.columns(2)
+            _prov = f" *(source: {_src_label})*" if source_meta_source == "DEMO" else ""
             with s_col1:
-                st.markdown(f"**Sensor Type:** `{source_meta.get('sensor_type', 'Unknown')}`")
-                st.markdown(f"**Processing Level:** `{source_meta.get('processing_level', '—')}`")
+                st.markdown(f"**Sensor Type:** `{source_meta.get('sensor_type') or '—'}`")
+                st.markdown(f"**Processing Level:** `{source_meta.get('processing_level') or '—'}`")
                 st.markdown(f"**Orbit:** `{source_meta.get('orbit_number') or '—'}`")
-                st.markdown(f"**Altitude:** `{source_meta.get('altitude_km', '—')} km`")
+                st.markdown(f"**Altitude:** `{source_meta.get('altitude_km') or '—'} km`")
                 gsd = source_meta.get("gsd_m_per_pixel")
-                st.markdown(f"**GSD:** `{gsd if gsd is not None else 'Unavailable'} m/pixel`")
+                st.markdown(f"**GSD:** `{f'{gsd} m/pixel' if gsd is not None else 'Not available'}`{_prov}")
                 dims = source_meta.get("dimensions", {})
-                st.markdown(f"**Dimensions:** `{dims.get('lines', '—')} × {dims.get('samples', '—')}`")
+                st.markdown(f"**Dimensions:** `{dims.get('lines') or '—'} × {dims.get('samples') or '—'}`")
             with s_col2:
-                st.markdown(f"**Projection:** `{source_meta.get('projection', '—')}`")
-                st.markdown(f"**Area:** `{source_meta.get('area', '—')}`")
-                st.markdown(f"**Sun Az/El/Inc:** `{source_meta.get('sun_azimuth_deg', '—')}° / {source_meta.get('sun_elevation_deg', '—')}° / {source_meta.get('solar_incidence_deg', '—')}°`")
-                st.markdown(f"**Roll/Pitch/Yaw:** `{source_meta.get('roll_deg', '—')}° / {source_meta.get('pitch_deg', '—')}° / {source_meta.get('yaw_deg', '—')}°`")
-                st.markdown(f"**Start:** `{source_meta.get('start_time', '—')}`")
-                st.markdown(f"**Stop:** `{source_meta.get('stop_time', '—')}`")
+                st.markdown(f"**Projection:** `{source_meta.get('projection') or '—'}`")
+                st.markdown(f"**Area:** `{source_meta.get('area') or '—'}`")
+                st.markdown(f"**Sun Az/El/Inc:** `{source_meta.get('sun_azimuth_deg') or '—'}° / {source_meta.get('sun_elevation_deg') or '—'}° / {source_meta.get('solar_incidence_deg') or '—'}°`")
+                st.markdown(f"**Roll/Pitch/Yaw:** `{source_meta.get('roll_deg') or '—'}° / {source_meta.get('pitch_deg') or '—'}° / {source_meta.get('yaw_deg') or '—'}°`")
+                st.markdown(f"**Start:** `{source_meta.get('start_time') or '—'}`")
+                st.markdown(f"**Stop:** `{source_meta.get('stop_time') or '—'}`")
 
             fp = source_meta.get("footprint", {})
-            st.markdown("**Refined Footprint Corners:**")
-            f_col1, f_col2 = st.columns(2)
-            with f_col1:
-                st.caption(f"**UL:** `{fp.get('upper_left', [])}`")
-                st.caption(f"**LL:** `{fp.get('lower_left', [])}`")
-            with f_col2:
-                st.caption(f"**UR:** `{fp.get('upper_right', [])}`")
-                st.caption(f"**LR:** `{fp.get('lower_right', [])}`")
+            if isinstance(fp, dict) and any(fp.get(k) for k in ("upper_left", "upper_right", "lower_left", "lower_right")):
+                st.markdown("**Source Footprint Corners:**")
+                f_col1, f_col2 = st.columns(2)
+                with f_col1:
+                    st.caption(f"**UL:** `{fp.get('upper_left', '—')}`")
+                    st.caption(f"**LL:** `{fp.get('lower_left', '—')}`")
+                with f_col2:
+                    st.caption(f"**UR:** `{fp.get('upper_right', '—')}`")
+                    st.caption(f"**LR:** `{fp.get('lower_right', '—')}`")
+            else:
+                st.caption("Source footprint: Not available from current metadata.")
 
             with st.expander("Canonical Parsed Dictionary (Source)", expanded=False):
                 st.json(source_meta)
-        else:
-            st.info("Upload source Chandrayaan-2 PDS4 XML to populate metadata.")
 
     with md_ref_col:
         st.markdown("### Reference / Fixed Image Metadata")
-        reference_meta_file = st.file_uploader("Upload reference metadata/XML/LBL", type=["xml", "txt", "lbl"], key="reference_meta_xml")
+
+        # ── If reference image is uploaded but no label is available ──────────
+        if reference_file is not None and not is_pair_001:
+            _ref_type = classify_product_file(reference_file.name)
+            st.caption(
+                f"Reference product: **{_ref_type}** | "
+                f"{len(reference_file.getvalue())/(1024**2):.1f} MB"
+            )
+
+        reference_meta_file = st.file_uploader(
+            "Upload reference metadata/XML/LBL",
+            type=["xml", "txt", "lbl"],
+            key="reference_meta_xml",
+        )
+
         if reference_meta_file is not None:
             reference_xml_bytes = reference_meta_file.getvalue()
             reference_meta = parse_metadata_xml(reference_xml_bytes, reference_meta_file.name)
-            st.caption(f"Label: **{reference_meta_file.name}** ({len(reference_xml_bytes)} bytes)")
-            print("REFERENCE PARSED METADATA\n", json.dumps(reference_meta, indent=2, default=str))
-            print("REFERENCE VALIDATION:\n", reference_meta.get("validation_errors", []))
-            print("reference XML byte length:", len(reference_xml_bytes))
+            st.caption(f"Label: **{reference_meta_file.name}** ({len(reference_xml_bytes):,} bytes)")
+            reference_meta_source = "UPLOADED_LABEL"
         elif is_pair_001:
+            # DEMO MODE only
             reference_meta = PAIR_001_REFERENCE.to_canonical_dict()
-            st.caption("Auto-configured from PAIR_001 demo specification (LRO LROC NAC EDR)")
+            st.caption("🔵 Demo metadata loaded by explicit DEMO MODE selection.")
+            reference_meta_source = "DEMO"
+        elif "_ref_manual_meta" in st.session_state:
+            # User previously entered metadata manually — persist across reruns
+            reference_meta = st.session_state["_ref_manual_meta"]
+            reference_meta_source = "MANUALLY_ENTERED"
         else:
+            # REAL MODE — no metadata provided yet
             reference_meta = empty_metadata_template()
+            reference_meta_source = "NOT_PROVIDED"
 
-        if reference_meta_file is not None or is_pair_001:
-            if reference_meta.get("valid"):
-                st.success("✓ Valid reference metadata")
+        reference_status = metadata_status(reference_meta, reference_meta_source)
+        _ref_icon   = reference_status["icon"]
+        _ref_label  = reference_status["label"]
+
+        # ── Status display ──────────────────────────────────────────────────
+        if reference_meta_source == "NOT_PROVIDED":
+            if reference_file is not None:
+                st.warning(
+                    "⚠️ Reference image uploaded — metadata is not yet available. "
+                    "Geographic overlap and scale validation require reference metadata."
+                )
             else:
-                err_msg = ", ".join(reference_meta.get("validation_errors", []))
-                st.error(f"✕ Invalid reference metadata: {err_msg}")
-            for warning in reference_meta.get("validation_warnings", []):
-                st.warning(warning)
+                st.info("Upload reference image and metadata to populate this section.")
+        elif reference_status["enum_status"] == MetadataStatus.DEMO:
+            st.info("🔵 **Demo metadata** — not a real uploaded product.")
+        elif reference_status["enum_status"] in (MetadataStatus.INCOMPLETE, MetadataStatus.INVALID):
+            err_msg = "; ".join(reference_meta.get("validation_errors", ["Incomplete"]))
+            st.warning(f"{_ref_icon} Reference metadata incomplete: {err_msg}")
+        else:
+            st.success(f"{_ref_icon} Reference metadata available ({_ref_label})")
 
+        for warning in reference_meta.get("validation_warnings", []):
+            st.warning(warning)
+
+        if reference_meta_source != "NOT_PROVIDED":
             r_col1, r_col2 = st.columns(2)
+            _prov = f" *(source: {_ref_label})*" if reference_meta_source == "DEMO" else ""
             with r_col1:
-                st.markdown(f"**Sensor Type:** `{reference_meta.get('sensor_type', 'Unknown')}`")
-                st.markdown(f"**Processing Level:** `{reference_meta.get('processing_level', '—')}`")
+                st.markdown(f"**Sensor Type:** `{reference_meta.get('sensor_type') or '—'}`")
+                st.markdown(f"**Processing Level:** `{reference_meta.get('processing_level') or '—'}`")
                 st.markdown(f"**Orbit:** `{reference_meta.get('orbit_number') or '—'}`")
-                st.markdown(f"**Altitude:** `{reference_meta.get('altitude_km', '—')} km`")
+                st.markdown(f"**Altitude:** `{reference_meta.get('altitude_km') or '—'} km`")
                 gsd = reference_meta.get("gsd_m_per_pixel")
-                st.markdown(f"**GSD:** `{gsd if gsd is not None else 'Unavailable'} m/pixel`")
+                st.markdown(f"**GSD:** `{f'{gsd} m/pixel' if gsd is not None else 'Not available'}`{_prov}")
                 dims = reference_meta.get("dimensions", {})
-                st.markdown(f"**Dimensions:** `{dims.get('lines', '—')} × {dims.get('samples', '—')}`")
+                st.markdown(f"**Dimensions:** `{dims.get('lines') or '—'} × {dims.get('samples') or '—'}`")
             with r_col2:
-                st.markdown(f"**Projection:** `{reference_meta.get('projection', '—')}`")
-                st.markdown(f"**Area:** `{reference_meta.get('area', '—')}`")
-                st.markdown(f"**Sun Az/El/Inc:** `{reference_meta.get('sun_azimuth_deg', '—')}° / {reference_meta.get('sun_elevation_deg', '—')}° / {reference_meta.get('solar_incidence_deg', '—')}°`")
-                st.markdown(f"**Roll/Pitch/Yaw:** `{reference_meta.get('roll_deg', '—')}° / {reference_meta.get('pitch_deg', '—')}° / {reference_meta.get('yaw_deg', '—')}°`")
-                st.markdown(f"**Start:** `{reference_meta.get('start_time', '—')}`")
-                st.markdown(f"**Stop:** `{reference_meta.get('stop_time', '—')}`")
+                st.markdown(f"**Projection:** `{reference_meta.get('projection') or '—'}`")
+                st.markdown(f"**Area:** `{reference_meta.get('area') or '—'}`")
+                st.markdown(f"**Sun Az/El/Inc:** `{reference_meta.get('sun_azimuth_deg') or '—'}° / {reference_meta.get('sun_elevation_deg') or '—'}° / {reference_meta.get('solar_incidence_deg') or '—'}°`")
+                st.markdown(f"**Roll/Pitch/Yaw:** `{reference_meta.get('roll_deg') or '—'}° / {reference_meta.get('pitch_deg') or '—'}° / {reference_meta.get('yaw_deg') or '—'}°`")
+                st.markdown(f"**Start:** `{reference_meta.get('start_time') or '—'}`")
+                st.markdown(f"**Stop:** `{reference_meta.get('stop_time') or '—'}`")
 
             fp = reference_meta.get("footprint", {})
-            st.markdown("**Refined Footprint Corners:**")
-            f_col1, f_col2 = st.columns(2)
-            with f_col1:
-                st.caption(f"**UL:** `{fp.get('upper_left', [])}`")
-                st.caption(f"**LL:** `{fp.get('lower_left', [])}`")
-            with f_col2:
-                st.caption(f"**UR:** `{fp.get('upper_right', [])}`")
-                st.caption(f"**LR:** `{fp.get('lower_right', [])}`")
+            if isinstance(fp, dict) and any(fp.get(k) for k in ("upper_left", "upper_right", "lower_left", "lower_right")):
+                st.markdown("**Reference Footprint Corners:**")
+                f_col1, f_col2 = st.columns(2)
+                with f_col1:
+                    st.caption(f"**UL:** `{fp.get('upper_left', '—')}`")
+                    st.caption(f"**LL:** `{fp.get('lower_left', '—')}`")
+                with f_col2:
+                    st.caption(f"**UR:** `{fp.get('upper_right', '—')}`")
+                    st.caption(f"**LR:** `{fp.get('lower_right', '—')}`")
+            else:
+                st.caption("Reference footprint: Not available from current metadata.")
 
             with st.expander("Canonical Parsed Dictionary (Reference)", expanded=False):
                 st.json(reference_meta)
-        else:
-            st.info("Upload reference metadata/label to populate metadata.")
 
-# ──────────────────────────────────────────────────────
+        # ── Manual reference metadata entry ─────────────────────────────────
+        if not is_pair_001 and reference_meta_source in ("NOT_PROVIDED", "MANUALLY_ENTERED"):
+            with st.expander("📝 Enter Reference Metadata Manually", expanded=(reference_meta_source == "MANUALLY_ENTERED")):
+                st.caption(
+                    "Minimum required for geographic validation: resolution, dimensions, "
+                    "and at least two footprint corner coordinates."
+                )
+                _man_pid = st.text_input(
+                    "Product ID",
+                    value=reference_meta.get("product_id") or "",
+                    key="man_ref_pid",
+                )
+                _man_c1, _man_c2, _man_c3 = st.columns(3)
+                with _man_c1:
+                    _man_gsd = st.number_input(
+                        "Resolution (m/pixel)", min_value=0.01, max_value=1000.0,
+                        value=float(reference_meta.get("gsd_m_per_pixel") or 2.0),
+                        step=0.01, format="%.4f", key="man_ref_gsd"
+                    )
+                    _man_lines = st.number_input(
+                        "Image lines", min_value=1,
+                        value=int(reference_meta.get("dimensions", {}).get("lines") or 1),
+                        step=1, key="man_ref_lines"
+                    )
+                with _man_c2:
+                    _man_samples = st.number_input(
+                        "Image samples", min_value=1,
+                        value=int(reference_meta.get("dimensions", {}).get("samples") or 1),
+                        step=1, key="man_ref_samples"
+                    )
+                    _man_inc = st.number_input(
+                        "Incidence angle (°)", min_value=0.0, max_value=180.0,
+                        value=float(reference_meta.get("solar_incidence_deg") or 0.0),
+                        step=0.01, key="man_ref_inc"
+                    )
+                with _man_c3:
+                    _man_alt = st.number_input(
+                        "Altitude (km)", min_value=0.0, max_value=1000.0,
+                        value=float(reference_meta.get("altitude_km") or 0.0),
+                        step=0.1, key="man_ref_alt"
+                    )
+                st.markdown("**Corner coordinates** (latitude, longitude)")
+                _fp_c1, _fp_c2 = st.columns(2)
+                _fp = reference_meta.get("footprint", {})
+                with _fp_c1:
+                    _ul = _fp.get("upper_left") or [0.0, 0.0]
+                    _man_ul_lat = st.number_input("UL Latitude",  value=float(_ul[0]) if len(_ul) > 0 else 0.0, step=0.001, format="%.5f", key="man_ul_lat")
+                    _man_ul_lon = st.number_input("UL Longitude", value=float(_ul[1]) if len(_ul) > 1 else 0.0, step=0.001, format="%.5f", key="man_ul_lon")
+                    _ll = _fp.get("lower_left") or [0.0, 0.0]
+                    _man_ll_lat = st.number_input("LL Latitude",  value=float(_ll[0]) if len(_ll) > 0 else 0.0, step=0.001, format="%.5f", key="man_ll_lat")
+                    _man_ll_lon = st.number_input("LL Longitude", value=float(_ll[1]) if len(_ll) > 1 else 0.0, step=0.001, format="%.5f", key="man_ll_lon")
+                with _fp_c2:
+                    _ur = _fp.get("upper_right") or [0.0, 0.0]
+                    _man_ur_lat = st.number_input("UR Latitude",  value=float(_ur[0]) if len(_ur) > 0 else 0.0, step=0.001, format="%.5f", key="man_ur_lat")
+                    _man_ur_lon = st.number_input("UR Longitude", value=float(_ur[1]) if len(_ur) > 1 else 0.0, step=0.001, format="%.5f", key="man_ur_lon")
+                    _lr = _fp.get("lower_right") or [0.0, 0.0]
+                    _man_lr_lat = st.number_input("LR Latitude",  value=float(_lr[0]) if len(_lr) > 0 else 0.0, step=0.001, format="%.5f", key="man_lr_lat")
+                    _man_lr_lon = st.number_input("LR Longitude", value=float(_lr[1]) if len(_lr) > 1 else 0.0, step=0.001, format="%.5f", key="man_lr_lon")
+
+                if st.button("✔ Apply Manual Reference Metadata", key="apply_man_ref"):
+                    _man_built = {
+                        "product_id":    _man_pid or "UNKNOWN",
+                        "mission":       reference_meta.get("mission") or "Lunar Reference",
+                        "sensor_type":   reference_meta.get("sensor_type") or reference_sensor or "Unknown",
+                        "processing_level": reference_meta.get("processing_level") or "Unknown",
+                        "gsd_m_per_pixel":  float(_man_gsd),
+                        "altitude_km":      float(_man_alt) if _man_alt else None,
+                        "solar_incidence_deg": float(_man_inc) if _man_inc else None,
+                        "sun_elevation_deg":   (90.0 - float(_man_inc)) if _man_inc else None,
+                        "dimensions":    {"lines": int(_man_lines), "samples": int(_man_samples)},
+                        "footprint": {
+                            "upper_left":  [_man_ul_lat, _man_ul_lon],
+                            "upper_right": [_man_ur_lat, _man_ur_lon],
+                            "lower_left":  [_man_ll_lat, _man_ll_lon],
+                            "lower_right": [_man_lr_lat, _man_lr_lon],
+                        },
+                        "valid": True,
+                        "validation_errors": [],
+                        "validation_warnings": ["Metadata manually entered — not parsed from product label."],
+                    }
+                    st.session_state["_ref_manual_meta"] = _man_built
+                    # Invalidate any previous pair result
+                    st.session_state.pop("result", None)
+                    st.session_state.pop("comp_result", None)
+                    st.rerun()
+
+# ──────────────────────────────────────────────────────────────────────────
 # PAIR VALIDATION & SCIENTIFIC SUMMARY GATE
-# ──────────────────────────────────────────────────────
+# Strict three-state: VALID / PENDING / REJECTED
+# REJECTED is only shown when both footprints exist and they don't overlap.
+# PENDING is shown whenever any required information is missing.
+# ──────────────────────────────────────────────────────────────────────────
 footprint_eval = evaluate_footprint_overlap(source_meta, reference_meta)
-src_gsd_val = source_meta.get("gsd_m_per_pixel") or (0.24 if is_pair_001 else None)
-ref_gsd_val = reference_meta.get("gsd_m_per_pixel") or (1.8669 if is_pair_001 else None)
+
+# GSD values — only from actual metadata, never from demo fallback
+src_gsd_val = source_meta.get("gsd_m_per_pixel")
+ref_gsd_val = reference_meta.get("gsd_m_per_pixel")
+
+# Dynamic scale ratio — never hardcoded
+_scale_ratio_display = scale_ratio_display(src_gsd_val, ref_gsd_val)
+# Legacy shim for downstream code that uses calculate_scale_ratio()
 scale_ratio_val, scale_ratio_str = calculate_scale_ratio(src_gsd_val, ref_gsd_val)
 
-# Pair Validation Card
-st.markdown("#### 🔬 Pair Validation Gate")
-val_c1, val_c2, val_c3 = st.columns(3)
-with val_c1:
-    if footprint_eval["has_overlap"] is True:
-        st.success("✓ Geographic footprint overlap confirmed")
-    elif footprint_eval["has_overlap"] is False:
-        st.error("✕ No meaningful geographic overlap detected")
-    else:
-        st.info("ℹ️ Footprint overlap: Coordinates pending")
+# Compute explicit state enums
+src_fp_status = compute_footprint_status(source_meta, source_status["enum_status"])
+ref_fp_status = compute_footprint_status(reference_meta, reference_status["enum_status"])
+pair_val_status, pair_val_reason = compute_pair_validation(
+    source_status["enum_status"],
+    reference_status["enum_status"],
+    src_fp_status,
+    ref_fp_status,
+    footprint_eval,
+)
 
-    if source_meta.get("valid"):
-        st.success(f"✓ Source metadata: {source_meta.get('mission', 'Chandrayaan-2')} {source_meta.get('sensor_type', '')}")
-    else:
-        st.warning("⚠️ Source metadata incomplete")
+st.markdown("#### 🔬 Pair Validation")
 
-with val_c2:
-    if reference_meta.get("valid"):
-        st.success(f"✓ Reference metadata: {reference_meta.get('mission', 'Lunar Ref')} {reference_meta.get('sensor_type', '')}")
+# ── Per-product status rows ──────────────────────────────────────────────
+val_src_col, val_ref_col, val_result_col = st.columns(3)
+with val_src_col:
+    st.markdown("**SOURCE / MOVING**")
+    _si, _sl = FOOTPRINT_STATUS_LABELS.get(src_fp_status, ("?", "?"))[:2]
+    if source_file:
+        st.success("✓ Image: Ready")
     else:
-        st.warning("⚠️ Reference metadata incomplete")
-
-    if scale_ratio_val is not None:
-        st.success(f"✓ {scale_ratio_str}")
+        st.warning("⚠ Image: Not uploaded")
+    _sm_icon = source_status["icon"]
+    _sm_lbl  = source_status["label"]
+    if source_status["enum_status"] == MetadataStatus.NOT_PROVIDED:
+        st.warning(f"⚠ Metadata: Not provided")
+    elif source_status["enum_status"] == MetadataStatus.INCOMPLETE:
+        st.warning(f"⚠ Metadata: Incomplete")
+    elif source_status["enum_status"] == MetadataStatus.DEMO:
+        st.info(f"🔵 Metadata: Demo")
     else:
-        st.info("ℹ️ Scale ratio: GSD pending")
+        st.success(f"✓ Metadata: {_sm_lbl}")
+    if src_fp_status == FootprintStatus.AVAILABLE:
+        st.success(f"✓ Footprint: {_si} {_sl}")
+    elif src_fp_status == FootprintStatus.PENDING:
+        st.warning(f"⚠ Footprint: ⏳ Pending")
+    else:
+        st.warning(f"⚠ Footprint: {_si} {_sl}")
 
-with val_c3:
+with val_ref_col:
+    st.markdown("**REFERENCE / FIXED**")
+    _ri, _rl = FOOTPRINT_STATUS_LABELS.get(ref_fp_status, ("?", "?"))[:2]
+    if reference_file:
+        st.success("✓ Image: Ready")
+    else:
+        st.warning("⚠ Image: Not uploaded")
+    _rm_icon = reference_status["icon"]
+    _rm_lbl  = reference_status["label"]
+    if reference_status["enum_status"] == MetadataStatus.NOT_PROVIDED:
+        st.warning(f"⚠ Metadata: Not provided")
+    elif reference_status["enum_status"] == MetadataStatus.INCOMPLETE:
+        st.warning(f"⚠ Metadata: Incomplete")
+    elif reference_status["enum_status"] == MetadataStatus.DEMO:
+        st.info(f"🔵 Metadata: Demo")
+    else:
+        st.success(f"✓ Metadata: {_rm_lbl}")
+    if ref_fp_status == FootprintStatus.AVAILABLE:
+        st.success(f"✓ Footprint: {_ri} {_rl}")
+    elif ref_fp_status == FootprintStatus.PENDING:
+        st.warning(f"⚠ Footprint: ⏳ Pending")
+    else:
+        st.warning(f"⚠ Footprint: {_ri} {_rl}")
+
+with val_result_col:
+    st.markdown("**PAIR RESULT**")
+    _pv_icon, _pv_title, _pv_detail = PAIR_STATUS_LABELS[pair_val_status]
+    if pair_val_status == PairValidationStatus.VALID:
+        st.success(f"{_pv_icon} {_pv_title}")
+    elif pair_val_status == PairValidationStatus.REJECTED:
+        st.error(f"{_pv_icon} {_pv_title}")
+    else:
+        st.warning(f"{_pv_icon} {_pv_title}")
+    st.caption(pair_val_reason)
+    # Scale ratio from actual metadata
+    if src_gsd_val is not None and ref_gsd_val is not None:
+        st.info(f"📐 {_scale_ratio_display}")
+    else:
+        st.caption(f"📐 {_scale_ratio_display}")
+    # Sensor mode
     is_cross_sensor = classify_sensor_path(source_sensor, reference_sensor) == "different"
-    st.info(f"✓ Mode: {'Cross-Mission / Cross-Sensor' if is_cross_sensor else 'Same-Sensor Modality'}")
-
-    has_files = (source_file is not None and reference_file is not None)
-    if not has_files:
-        st.warning("⚠️ Pending image file upload")
-    elif not footprint_eval["gate_passed"]:
-        st.error("✕ Pipeline halted by geographic gate")
-    else:
-        st.success("✓ Ready for matching execution")
+    st.caption(f"Mode: {'Cross-Mission / Cross-Sensor' if is_cross_sensor else 'Same-Sensor Modality'}")
 
 # Scientific Pair Summary
 with st.expander("📊 Scientific Pair Summary (Metadata vs Derived Parameters)", expanded=False):
     s_col_meta, s_col_derived = st.columns(2)
     with s_col_meta:
         st.markdown("##### AVAILABLE METADATA")
-        st.markdown(f"- **Source Product ID:** `{source_meta.get('product_id') or (PAIR_001_SOURCE.product_id if is_pair_001 else '—')}`")
-        st.markdown(f"- **Reference Product ID:** `{reference_meta.get('product_id') or (PAIR_001_REFERENCE.product_id if is_pair_001 else '—')}`")
-        st.markdown(f"- **Source Resolution (GSD):** `{src_gsd_val if src_gsd_val is not None else '—'} m/pixel`")
-        st.markdown(f"- **Reference Resolution (GSD):** `{ref_gsd_val if ref_gsd_val is not None else '—'} m/pixel`")
-        st.markdown(f"- **Source Calibration:** `{source_meta.get('processing_level', 'Calibrated')}`")
-        st.markdown(f"- **Reference State:** `{reference_meta.get('processing_level', 'EDR')}`")
-        st.markdown(f"- **Source Sun Geometry:** Azimuth: `{source_meta.get('sun_azimuth_deg', '—')}°`, Elevation: `{source_meta.get('sun_elevation_deg', '—')}°`")
-        st.markdown(f"- **Reference Sun Geometry:** Azimuth: `{reference_meta.get('sun_azimuth_deg', '—')}°`, Elevation: `{reference_meta.get('sun_elevation_deg', '—')}°`")
+        st.markdown(f"- **Source Product ID:** `{source_meta.get('product_id') or 'Not available'}`  *(provenance: {source_status['label']})*")
+        st.markdown(f"- **Reference Product ID:** `{reference_meta.get('product_id') or 'Not available'}`  *(provenance: {reference_status['label']})*")
+        st.markdown(f"- **Source Resolution (GSD):** `{f'{src_gsd_val} m/pixel' if src_gsd_val is not None else 'Not available'}`")
+        st.markdown(f"- **Reference Resolution (GSD):** `{f'{ref_gsd_val} m/pixel' if ref_gsd_val is not None else 'Not available'}`")
+        st.markdown(f"- **Source Calibration:** `{source_meta.get('processing_level') or 'Not available'}`")
+        st.markdown(f"- **Reference State:** `{reference_meta.get('processing_level') or 'Not available'}`")
+        st.markdown(f"- **Source Sun Geometry:** Az: `{source_meta.get('sun_azimuth_deg') or '—'}°`, El: `{source_meta.get('sun_elevation_deg') or '—'}°`")
+        st.markdown(f"- **Reference Sun Geometry:** Az: `{reference_meta.get('sun_azimuth_deg') or '—'}°`, El: `{reference_meta.get('sun_elevation_deg') or '—'}°`")
     with s_col_derived:
         st.markdown("##### DERIVED PARAMETERS")
-        st.markdown(f"- **Scale Difference:** `{scale_ratio_str}`")
-        st.markdown(f"- **Estimated Overlap Area:** `{footprint_eval.get('overlap_area_sq_deg', 0.0):.4f} sq. deg`")
+        st.markdown(f"- **Scale Difference:** `{_scale_ratio_display}`")
+        _ov_area = footprint_eval.get('overlap_area_sq_deg')
+        _ov_str = f"{_ov_area:.4f} sq. deg" if _ov_area else "Not evaluated (footprint pending)"
+        st.markdown(f"- **Geographic Overlap Area:** `{_ov_str}`")
         if source_meta.get("sun_elevation_deg") is not None and reference_meta.get("sun_elevation_deg") is not None:
             el_diff = abs(float(source_meta["sun_elevation_deg"]) - float(reference_meta["sun_elevation_deg"]))
-            st.markdown(f"- **Potential Illumination (Elevation) Difference:** `~{el_diff:.2f}°`")
+            st.markdown(f"- **Illumination Elevation Difference:** `~{el_diff:.2f}°`")
         else:
-            st.markdown("- **Potential Illumination Difference:** `Derived when sun angles available`")
-        st.markdown(f"- **Sensor Domain Relation:** `{'Cross-Mission (Chandrayaan-2 → Lunar Reference)' if is_cross_sensor else 'Same Sensor'}`")
-        st.markdown(f"- **Overlap Gate Status:** `{'PASSED' if footprint_eval['gate_passed'] else 'REJECTED'}`")
+            st.markdown("- **Illumination Difference:** `Not available — sun angles pending`")
+        st.markdown(f"- **Sensor Domain Relation:** `{'Cross-Mission (Chandrayaan-2 → Lunar Reference)' if is_cross_sensor else 'Same-Sensor Modality'}`")
+        st.markdown(f"- **Pair Validation Status:** `{pair_val_status.value}`")
+        st.markdown(f"- **Overlap Gate:** `{footprint_eval.get('status', 'pending').upper()}`")
 
 if not (source_file and reference_file):
     st.info("ℹ️ **Metadata pair configured.** Upload/select the actual product files to execute processing.")
@@ -2932,7 +3187,29 @@ with st.expander("Pipeline controls", expanded=True):
     residual_correction = st.checkbox("Enable smooth terrain/model residual correction", True)
     enable_comparison = st.checkbox("Run experimental MAGSAC++ vs RANSAC comparison", False)
 
-run = st.button("🚀 Run LunaMatch V3", type="primary", disabled=not (source_file and reference_file))
+execution_mode = st.radio(
+    "Execution mode",
+    ["Scientific / validated mode", "Experimental image-only mode"],
+    horizontal=True,
+    help="Image-only mode does not claim geographic overlap, geographic consistency, or metadata-based scale validation.",
+)
+scientific_ready = bool(
+    source_file and reference_file
+    and source_status["status"] not in {"INCOMPLETE", "NOT_PROVIDED"}
+    and reference_status["status"] not in {"INCOMPLETE", "NOT_PROVIDED"}
+    and footprint_eval.get("has_overlap") is True
+)
+image_only_ready = bool(source_file and reference_file)
+if execution_mode == "Scientific / validated mode" and not scientific_ready:
+    st.error("RUN BLOCKED: Scientific mode requires source/reference metadata and confirmed geographic overlap.")
+elif execution_mode == "Experimental image-only mode" and image_only_ready:
+    st.warning("EXPERIMENTAL - NO GEOGRAPHIC VALIDATION")
+
+run = st.button(
+    "🚀 Run LunaMatch V3",
+    type="primary",
+    disabled=not (scientific_ready if execution_mode == "Scientific / validated mode" else image_only_ready),
+)
 
 if run:
     try:
@@ -3279,11 +3556,12 @@ if result:
         d4.download_button("Research report JSON", json.dumps(report, indent=2).encode(), "lunamatch_report.json", "application/json")
 
         st.markdown("#### Experiment Persistence")
-        if st.button("💾 Save Experiment Record (PAIR_001)", type="secondary"):
+        active_pair_id = "PAIR_001" if is_pair_001 else f"EXP_{str(source_meta.get('product_id') or 'SRC')[:16]}_{str(reference_meta.get('product_id') or 'REF')[:16]}"
+        if st.button(f"💾 Save Experiment Record ({active_pair_id})", type="secondary"):
             try:
                 exp_mgr = ExperimentManager()
                 saved_dir = exp_mgr.save_experiment(
-                    pair_id="PAIR_001",
+                    pair_id=active_pair_id,
                     source_meta=source_meta,
                     reference_meta=reference_meta,
                     config={

@@ -78,7 +78,7 @@ def parse_lro_pds3_label(data: bytes | str, filename: str = "") -> Dict[str, Any
     sample_bits = get_int("SAMPLE_BITS", 8)
     sample_type = get_val("SAMPLE_TYPE", "UNSIGNED_INTEGER")
 
-    resolution = get_float("SCALED_PIXEL_WIDTH") or get_float("RESOLUTION") or 1.8669
+    resolution = get_float("SCALED_PIXEL_WIDTH") or get_float("RESOLUTION")
 
     # Geometry
     incidence = get_float("INCIDENCE_ANGLE")
@@ -109,7 +109,10 @@ def parse_lro_pds3_label(data: bytes | str, filename: str = "") -> Dict[str, Any
     # Sun elevation is 90 - incidence angle
     sun_elevation = (90.0 - incidence) if incidence is not None else None
 
-    is_valid = bool(lines and samples) or bool(product_id)
+    # Keep ``valid`` as the historical parser-recognized-record flag. The app
+    # separately requires complete resolution and footprint metadata before
+    # scientific validation can run.
+    is_valid = bool(product_id and lines and samples)
 
     return {
         "mission": inst_host,
@@ -136,7 +139,7 @@ def parse_lro_pds3_label(data: bytes | str, filename: str = "") -> Dict[str, Any
         "data_type": sample_type,
         "sample_bits": sample_bits,
         "valid": is_valid,
-        "validation_errors": [] if is_valid else ["Failed to extract valid PDS3 image records"],
+        "validation_errors": [] if is_valid else ["Reference metadata is incomplete"],
         "validation_warnings": [],
     }
 

@@ -38,6 +38,62 @@ def get_footprint_bounds(meta: Dict[str, Any]) -> Optional[Tuple[float, float, f
     return None
 
 
+def _footprint_polygon(meta: Dict[str, Any]) -> Optional[List[Tuple[float, float]]]:
+    """Return an ordered lat/lon polygon with longitudes unwrapped locally."""
+    fp = meta.get("footprint") if isinstance(meta, dict) else None
+    if not isinstance(fp, dict):
+        return None
+    corners = [fp.get(name) for name in ("upper_left", "upper_right", "lower_right", "lower_left")]
+    if any(not isinstance(point, (list, tuple)) or len(point) != 2 for point in corners):
+        return None
+
+    polygon = [(float(point[0]), float(point[1]) % 360.0) for point in corners]
+    unwrapped = [polygon[0]]
+    for lat, lon in polygon[1:]:
+        previous_lon = unwrapped[-1][1]
+        while lon - previous_lon > 180.0:
+            lon -= 360.0
+        while lon - previous_lon < -180.0:
+            lon += 360.0
+        unwrapped.append((lat, lon))
+    return unwrapped
+
+
+def _orientation(a, b, c) -> float:
+    return (b[1] - a[1]) * (c[0] - b[0]) - (b[0] - a[0]) * (c[1] - b[1])
+
+
+def _segments_intersect(a, b, c, d) -> bool:
+    def sign(value):
+        return (value > 1e-9) - (value < -1e-9)
+
+    o1, o2 = sign(_orientation(a, b, c)), sign(_orientation(a, b, d))
+    o3, o4 = sign(_orientation(c, d, a)), sign(_orientation(c, d, b))
+    return o1 != o2 and o3 != o4
+
+
+def _point_in_polygon(point, polygon) -> bool:
+    inside = False
+    px, py = point
+    for index, (x1, y1) in enumerate(polygon):
+        x2, y2 = polygon[(index + 1) % len(polygon)]
+        if (y1 > py) != (y2 > py):
+            x_at_y = (x2 - x1) * (py - y1) / (y2 - y1) + x1
+            if px < x_at_y:
+                inside = not inside
+    return inside
+
+
+def _polygons_intersect(first, second) -> bool:
+    for index, first_start in enumerate(first):
+        first_end = first[(index + 1) % len(first)]
+        for second_index, second_start in enumerate(second):
+            second_end = second[(second_index + 1) % len(second)]
+            if _segments_intersect(first_start, first_end, second_start, second_end):
+                return True
+    return _point_in_polygon(first[0], second) or _point_in_polygon(second[0], first)
+
+
 def evaluate_footprint_overlap(source_meta: Dict[str, Any], reference_meta: Dict[str, Any]) -> Dict[str, Any]:
     """Evaluate geographic footprint overlap between source and reference imagery.
 
@@ -47,22 +103,40 @@ def evaluate_footprint_overlap(source_meta: Dict[str, Any], reference_meta: Dict
 Matching was not executed because the source and reference
 images are geographically inconsistent."
     """
-    src_bounds = get_footprint_bounds(source_meta)
-    ref_bounds = get_footprint_bounds(reference_meta)
+    src_polygon = _footprint_polygon(source_meta)
+    ref_polygon = _footprint_polygon(reference_meta)
 
-    if src_bounds is None or ref_bounds is None:
+    if src_polygon is None or ref_polygon is None:
         return {
             "available": False,
             "has_overlap": None,
+            "overlap": None,
             "overlap_area_sq_deg": 0.0,
             "intersection_bounds": None,
-            "source_bounds": src_bounds,
-            "reference_bounds": ref_bounds,
-            "gate_passed": True,  # Cannot gate out if footprints unavailable
-            "gate_message": "Geographic coordinates unavailable for one or both products. Pipeline proceeding with cautious feature-space validation.",
-            "status": "warning",
+            "source_bounds": None,
+            "reference_bounds": None,
+            "gate_passed": False,
+            "gate_message": "Geographic overlap cannot yet be evaluated; one or both footprints are unavailable.",
+            "status": "pending",
         }
 
+    # Move the reference polygon onto the longitude branch nearest the source
+    # polygon so 0/360-degree crossings do not become artificial gaps.
+    src_center = sum(point[1] for point in src_polygon) / len(src_polygon)
+    ref_center = sum(point[1] for point in ref_polygon) / len(ref_polygon)
+    longitude_shift = round((src_center - ref_center) / 360.0) * 360.0
+    ref_polygon = [(lat, lon + longitude_shift) for lat, lon in ref_polygon]
+
+    src_bounds = (
+        min(point[0] for point in src_polygon), max(point[0] for point in src_polygon),
+        min(point[1] for point in src_polygon), max(point[1] for point in src_polygon),
+    )
+    ref_bounds = (
+        min(point[0] for point in ref_polygon), max(point[0] for point in ref_polygon),
+        min(point[1] for point in ref_polygon), max(point[1] for point in ref_polygon),
+    )
+
+    has_overlap = _polygons_intersect(src_polygon, ref_polygon)
     s_min_lat, s_max_lat, s_min_lon, s_max_lon = src_bounds
     r_min_lat, r_max_lat, r_min_lon, r_max_lon = ref_bounds
 
@@ -74,8 +148,6 @@ images are geographically inconsistent."
     lat_overlap = inter_max_lat - inter_min_lat
     lon_overlap = inter_max_lon - inter_min_lon
 
-    has_overlap = (lat_overlap > 0) and (lon_overlap > 0)
-
     if not has_overlap:
         gate_msg = (
             "No meaningful geographic overlap detected.\n"
@@ -85,6 +157,7 @@ images are geographically inconsistent."
         return {
             "available": True,
             "has_overlap": False,
+            "overlap": False,
             "overlap_area_sq_deg": 0.0,
             "intersection_bounds": None,
             "source_bounds": src_bounds,
@@ -94,7 +167,7 @@ images are geographically inconsistent."
             "status": "rejected",
         }
 
-    overlap_area = float(lat_overlap * lon_overlap)
+    overlap_area = float(max(lat_overlap, 0.0) * max(lon_overlap, 0.0))
     src_area = max((s_max_lat - s_min_lat) * (s_max_lon - s_min_lon), 1e-9)
     ref_area = max((r_max_lat - r_min_lat) * (r_max_lon - r_min_lon), 1e-9)
     overlap_fraction = float(overlap_area / min(src_area, ref_area))
@@ -102,6 +175,7 @@ images are geographically inconsistent."
     return {
         "available": True,
         "has_overlap": True,
+        "overlap": True,
         "overlap_area_sq_deg": overlap_area,
         "overlap_fraction": overlap_fraction,
         "intersection_bounds": (inter_min_lat, inter_max_lat, inter_min_lon, inter_max_lon),
@@ -109,7 +183,7 @@ images are geographically inconsistent."
         "reference_bounds": ref_bounds,
         "gate_passed": True,
         "gate_message": f"Geographic overlap confirmed ({overlap_fraction*100:.1f}% common coverage, {overlap_area:.4f} sq. deg).",
-        "status": "success",
+        "status": "validated",
     }
 
 
