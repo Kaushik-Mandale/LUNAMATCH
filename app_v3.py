@@ -1178,10 +1178,10 @@ def lroc_catalog_metadata_record(image_name: str) -> dict:
             "projection": "Polar stereographic",
             "area": "Unknown",
             "footprint": {
-                "upper_left": [-89.0, 359.0],
-                "upper_right": [-89.0, 1.0],
-                "lower_left": [-90.0, 359.0],
-                "lower_right": [-90.0, 1.0],
+                "upper_left": [-88.07, 211.75],
+                "upper_right": [-88.26, 197.21],
+                "lower_left": [-88.96, 293.28],
+                "lower_right": [-89.40, 311.20],
             },
             "dimensions": {"lines": 1024, "samples": 1024},
             "data_type": None,
@@ -3444,9 +3444,9 @@ with st.expander("📊 Scientific Pair Summary (Metadata vs Derived Parameters)"
         _ov_area = footprint_eval.get('overlap_area_sq_deg')
         _ov_str = f"{_ov_area:.8f} sq. deg" if _ov_area else "Not evaluated (footprint pending)"
         st.markdown(f"- **Geographic Overlap Area:** `{_ov_str}`")
-        st.markdown(f"- **Intersection / source:** `{footprint_eval.get('intersection_percent_of_source', 0.0):.3f}%`")
-        st.markdown(f"- **Intersection / reference:** `{footprint_eval.get('intersection_percent_of_reference', 0.0):.3f}%`")
-        st.markdown(f"- **Intersection / smaller:** `{footprint_eval.get('intersection_percent_of_smaller', 0.0):.3f}%`")
+        st.markdown(f"- **Intersection / source:** `{footprint_eval.get('intersection_percent_of_source', 0.0):.6f}%`")
+        st.markdown(f"- **Intersection / reference:** `{footprint_eval.get('intersection_percent_of_reference', 0.0):.6f}%`")
+        st.markdown(f"- **Intersection / smaller:** `{footprint_eval.get('intersection_percent_of_smaller', 0.0):.6f}%`")
         if source_meta.get("sun_elevation_deg") is not None and reference_meta.get("sun_elevation_deg") is not None:
             el_diff = abs(float(source_meta["sun_elevation_deg"]) - float(reference_meta["sun_elevation_deg"]))
             st.markdown(f"- **Illumination Elevation Difference:** `~{el_diff:.2f}°`")
@@ -3454,6 +3454,7 @@ with st.expander("📊 Scientific Pair Summary (Metadata vs Derived Parameters)"
             st.markdown("- **Illumination Difference:** `Not available — sun angles pending`")
         st.markdown(f"- **Sensor Domain Relation:** `{'Cross-Mission (Chandrayaan-2 → Lunar Reference)' if is_cross_sensor else 'Same-Sensor Modality'}`")
         st.markdown(f"- **Pair Validation Status:** `{pair_val_status.value}`")
+        st.markdown(f"- **Geometry Status:** `{footprint_eval.get('geometry_status', 'INSUFFICIENT_GEOMETRY_METADATA')}`")
         st.markdown(f"- **Overlap Gate:** `{footprint_eval.get('status', 'pending').upper()}`")
     if footprint_eval.get("source_polygon") and footprint_eval.get("reference_polygon"):
         _pre_map = render_footprint_overlap_map(footprint_eval)
@@ -3468,15 +3469,24 @@ with st.expander("GEOGRAPHIC OVERLAP", expanded=False):
         st.json(footprint_eval.get("reference_polygon"))
         st.markdown("**Intersection polygon**")
         st.json(footprint_eval.get("overlap_polygon", []))
+        with st.expander("Projected geometry debug", expanded=False):
+            st.markdown("**Projected source vertices (km)**")
+            st.json(footprint_eval.get("projected_source_polygon", []))
+            st.markdown("**Projected reference vertices (km)**")
+            st.json(footprint_eval.get("projected_reference_polygon", []))
+            st.markdown("**Projected intersection vertices (km)**")
+            st.json(footprint_eval.get("projected_overlap_polygon", []))
+            st.json(footprint_eval.get("projection_debug", {}))
         geo_c1, geo_c2, geo_c3 = st.columns(3)
         geo_c1.metric("Source area", f"{footprint_eval.get('source_area_km2', 0.0):.6f} km²")
         geo_c2.metric("Reference area", f"{footprint_eval.get('reference_area_km2', 0.0):.6f} km²")
         geo_c3.metric("Intersection", f"{footprint_eval.get('overlap_area_km2', 0.0):.6f} km²")
-        st.markdown(f"- **Intersection / source:** `{footprint_eval.get('intersection_percent_of_source', 0.0):.3f}%`")
-        st.markdown(f"- **Intersection / reference:** `{footprint_eval.get('intersection_percent_of_reference', 0.0):.3f}%`")
-        st.markdown(f"- **Intersection / smaller:** `{footprint_eval.get('intersection_percent_of_smaller', 0.0):.3f}%`")
+        st.markdown(f"- **Intersection / source:** `{footprint_eval.get('intersection_percent_of_source', 0.0):.6f}%`")
+        st.markdown(f"- **Intersection / reference:** `{footprint_eval.get('intersection_percent_of_reference', 0.0):.6f}%`")
+        st.markdown(f"- **Intersection / smaller:** `{footprint_eval.get('intersection_percent_of_smaller', 0.0):.6f}%`")
         st.markdown(f"- **Minimum required:** `{footprint_eval.get('minimum_overlap_percentage', 0.1):.3f}%`")
-        st.markdown(f"- **Status:** `{footprint_eval.get('status', 'pending').upper()}`")
+        st.markdown(f"- **Geometry status:** `{footprint_eval.get('geometry_status', 'INSUFFICIENT_GEOMETRY_METADATA')}`")
+        st.markdown(f"- **Pair status:** `{pair_val_status.value}`")
     else:
         st.info("Geographic overlap geometry is pending valid source and reference footprints.")
 

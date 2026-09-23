@@ -11,6 +11,15 @@ import math
 from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 
+try:
+    from rasterio.crs import CRS
+    from rasterio.warp import transform as _crs_transform
+    _HAS_PROJ = True
+except ImportError:
+    CRS = None
+    _crs_transform = None
+    _HAS_PROJ = False
+
 LUNAR_RADIUS_KM = 1737.4
 LUNAR_RADIUS_PROVENANCE = "STANDARD_LUNAR_CONSTANT"
 
@@ -24,7 +33,18 @@ def validate_projection(meta: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "UNSUPPORTED", "projection": meta.get("projection"), "provenance": "PRODUCT_METADATA", "message": f"Projection '{meta.get('projection')}' is not supported by the lunar footprint engine."}
     radius = meta.get("planetary_radius_km") or meta.get("lunar_radius_km") or LUNAR_RADIUS_KM
     provenance = "PRODUCT_METADATA" if meta.get("planetary_radius_km") or meta.get("lunar_radius_km") else LUNAR_RADIUS_PROVENANCE
-    return {"status": "VALID", "projection": meta.get("projection"), "provenance": provenance, "radius_km": float(radius), "message": "Projection is supported; lunar radius provenance is explicit."}
+    parameters = meta.get("projection_parameters") if isinstance(meta.get("projection_parameters"), dict) else {}
+    if not _HAS_PROJ:
+        return {"status": "PROJECTION_ERROR", "projection": meta.get("projection"), "provenance": provenance, "radius_km": float(radius), "message": "The PROJ projection engine is unavailable."}
+    return {
+        "status": "VALID",
+        "projection": meta.get("projection"),
+        "provenance": provenance,
+        "radius_km": float(radius),
+        "parameters": parameters,
+        "crs_engine": "PROJ via rasterio",
+        "message": "Lunar polar stereographic projection is available through the PROJ engine.",
+    }
 
 
 @dataclass
@@ -201,6 +221,48 @@ def _footprint_polygon(meta: Dict[str, Any]) -> Optional[List[Tuple[float, float
     return unwrapped
 
 
+def _project_polar_polygon(
+    polygon: List[Tuple[float, float]],
+    projection_status: Dict[str, Any],
+) -> Tuple[Optional[List[Tuple[float, float]]], Dict[str, Any]]:
+    """Project a lat/lon footprint through the shared PROJ polar CRS in km."""
+    if not polygon or projection_status.get("status") != "VALID" or not _HAS_PROJ:
+        return None, {"status": "PROJECTION_ERROR", "message": "Polar projection is unavailable."}
+
+    params = projection_status.get("parameters") or {}
+    radius_m = float(projection_status.get("radius_km", LUNAR_RADIUS_KM)) * 1000.0
+    try:
+        proj4 = (
+            "+proj=stere +lat_0={lat_0} +lat_ts={lat_ts} +lon_0={lon_0} "
+            "+x_0={x_0} +y_0={y_0} +a={a} +b={b} +units=m +no_defs"
+        ).format(
+            lat_0=float(params.get("latitude_of_origin", params.get("lat_0", -90.0))),
+            lat_ts=float(params.get("latitude_true_scale", params.get("lat_ts", -90.0))),
+            lon_0=float(params.get("central_meridian", params.get("lon_0", 0.0))),
+            x_0=float(params.get("false_easting", params.get("x_0", 0.0))),
+            y_0=float(params.get("false_northing", params.get("y_0", 0.0))),
+            a=float(params.get("semi_major_axis_m", params.get("a", radius_m))),
+            b=float(params.get("semi_minor_axis_m", params.get("b", radius_m))),
+        )
+        crs = CRS.from_proj4(proj4)
+        geographic_crs = CRS.from_proj4(
+            "+proj=longlat +R={radius} +no_defs".format(radius=radius_m)
+        )
+        lats = [point[0] for point in polygon]
+        lons = [point[1] % 360.0 for point in polygon]
+        xs, ys = _crs_transform(geographic_crs, crs, lons, lats)
+        projected = [(float(x) / 1000.0, float(y) / 1000.0) for x, y in zip(xs, ys)]
+        return projected, {
+            "status": "VALID",
+            "engine": "PROJ via rasterio",
+            "crs": crs.to_wkt(),
+            "proj4": proj4,
+            "vertices_km": projected,
+        }
+    except Exception as exc:
+        return None, {"status": "PROJECTION_ERROR", "message": str(exc)}
+
+
 def _orientation(a, b, c) -> float:
     return (b[1] - a[1]) * (c[0] - b[0]) - (b[0] - a[0]) * (c[1] - b[1])
 
@@ -234,6 +296,33 @@ def _polygons_intersect(first, second) -> bool:
             if _segments_intersect(first_start, first_end, second_start, second_end):
                 return True
     return _point_in_polygon(first[0], second) or _point_in_polygon(second[0], first)
+
+
+def _polygon_is_valid(polygon) -> bool:
+    """Validate a simple polygon before clipping it."""
+    if not polygon or len(polygon) < 3 or abs(_signed_polygon_area(polygon)) <= 1e-12:
+        return False
+    for first_index in range(len(polygon)):
+        first_start = polygon[first_index]
+        first_end = polygon[(first_index + 1) % len(polygon)]
+        if math.hypot(first_end[0] - first_start[0], first_end[1] - first_start[1]) <= 1e-12:
+            continue
+        for second_index in range(first_index + 1, len(polygon)):
+            if second_index in {first_index, (first_index - 1) % len(polygon), (first_index + 1) % len(polygon)}:
+                continue
+            second_start = polygon[second_index]
+            second_end = polygon[(second_index + 1) % len(polygon)]
+            if math.hypot(second_end[0] - second_start[0], second_end[1] - second_start[1]) <= 1e-12:
+                continue
+            if any(
+                math.hypot(first_point[0] - second_point[0], first_point[1] - second_point[1]) <= 1e-12
+                for first_point in (first_start, first_end)
+                for second_point in (second_start, second_end)
+            ):
+                continue
+            if _segments_intersect(first_start, first_end, second_start, second_end):
+                return False
+    return True
 
 
 def evaluate_footprint_overlap(
@@ -291,12 +380,20 @@ def evaluate_footprint_overlap(
             "gate_passed": False,
             "gate_message": "Geographic overlap cannot yet be evaluated; one or both footprints are unavailable.",
             "status": "pending",
+            "geometry_status": "INSUFFICIENT_GEOMETRY_METADATA",
             "minimum_overlap_percentage": min_overlap_percentage,
             "projection_status": {"source": source_projection, "reference": reference_projection},
         }
 
     # Detect if footprints are near the lunar South Pole
-    is_polar = all(p[0] <= -60.0 for p in src_polygon + ref_polygon)
+    projection_names = (
+        str(source_projection.get("projection") or "").lower(),
+        str(reference_projection.get("projection") or "").lower(),
+    )
+    is_polar = (
+        all(p[0] <= -60.0 for p in src_polygon + ref_polygon)
+        and all("polar" in name or "stereographic" in name for name in projection_names)
+    )
 
     if is_polar:
         # Polar stereographic planar space (km)
@@ -308,13 +405,58 @@ def evaluate_footprint_overlap(
                 "gate_passed": False,
                 "gate_message": "Projection validation is incomplete; geographic overlap was not evaluated.",
                 "status": "geometry_error",
+                "geometry_status": "PROJECTION_ERROR",
                 "minimum_overlap_percentage": min_overlap_percentage,
                 "projection_status": {"source": source_projection, "reference": reference_projection},
             }
+        src_proj, src_projection_debug = _project_polar_polygon(src_polygon, source_projection)
+        ref_proj, ref_projection_debug = _project_polar_polygon(ref_polygon, reference_projection)
+        if src_proj is None or ref_proj is None:
+            return {
+                "available": True,
+                "has_overlap": None,
+                "overlap": None,
+                "overlap_area_sq_deg": 0.0,
+                "overlap_area_km2": 0.0,
+                "intersection_bounds": None,
+                "source_bounds": None,
+                "reference_bounds": None,
+                "gate_passed": False,
+                "gate_message": "Projection failed; geographic overlap was not evaluated.",
+                "status": "geometry_error",
+                "geometry_status": "PROJECTION_ERROR",
+                "projection_status": {"source": source_projection, "reference": reference_projection},
+                "projected_source_polygon": src_projection_debug.get("vertices_km", []),
+                "projected_reference_polygon": ref_projection_debug.get("vertices_km", []),
+                "projection_debug": {"source": src_projection_debug, "reference": ref_projection_debug},
+                "minimum_overlap_percentage": min_overlap_percentage,
+            }
+        if (
+            not _polygon_is_valid(src_proj)
+            or not _polygon_is_valid(ref_proj)
+            or source_projection.get("radius_km") != reference_projection.get("radius_km")
+            or source_projection.get("parameters", {}) != reference_projection.get("parameters", {})
+        ):
+            return {
+                "available": True,
+                "has_overlap": None,
+                "overlap": None,
+                "overlap_area_sq_deg": 0.0,
+                "overlap_area_km2": 0.0,
+                "intersection_bounds": None,
+                "source_bounds": None,
+                "reference_bounds": None,
+                "gate_passed": False,
+                "gate_message": "Footprint geometry or shared projection parameters are invalid.",
+                "status": "geometry_error",
+                "geometry_status": "INVALID_GEOMETRY",
+                "projection_status": {"source": source_projection, "reference": reference_projection},
+                "projected_source_polygon": src_proj,
+                "projected_reference_polygon": ref_proj,
+                "projection_debug": {"source": src_projection_debug, "reference": ref_projection_debug},
+                "minimum_overlap_percentage": min_overlap_percentage,
+            }
         src_radius = source_projection.get("radius_km", LUNAR_RADIUS_KM)
-        ref_radius = reference_projection.get("radius_km", LUNAR_RADIUS_KM)
-        src_proj = [to_polar_stereographic(lat, lon, src_radius) for lat, lon in src_polygon]
-        ref_proj = [to_polar_stereographic(lat, lon, ref_radius) for lat, lon in ref_polygon]
         has_overlap = _polygons_intersect(src_proj, ref_proj)
 
         src_bounds = (
@@ -351,9 +493,13 @@ def evaluate_footprint_overlap(
                 "gate_passed": False,
                 "gate_message": gate_msg,
                 "status": "rejected",
+                "geometry_status": "VALID_NO_INTERSECTION",
                 "source_polygon": src_polygon,
                 "reference_polygon": ref_polygon,
+                "projected_source_polygon": src_proj,
+                "projected_reference_polygon": ref_proj,
                 "overlap_polygon": [],
+                "projection_debug": {"source": src_projection_debug, "reference": ref_projection_debug},
                 "source_area": source_area,
                 "reference_area": reference_area,
                 "overlap_area": 0.0,
@@ -394,7 +540,12 @@ def evaluate_footprint_overlap(
                 "minimum_overlap_percentage": min_overlap_percentage,
                 "gate_message": f"Insufficient geographic overlap detected ({pct_smaller:.3f}% of the smaller footprint is below the {min_overlap_percentage:.3f}% threshold). Matching blocked.",
                 "status": "insufficient_overlap",
+                "geometry_status": "VALID_INTERSECTION",
                 "projection_status": {"source": source_projection, "reference": reference_projection},
+                "projected_source_polygon": src_proj,
+                "projected_reference_polygon": ref_proj,
+                "projected_overlap_polygon": overlap_proj,
+                "projection_debug": {"source": src_projection_debug, "reference": ref_projection_debug},
             }
 
         return {
@@ -415,7 +566,12 @@ def evaluate_footprint_overlap(
             "minimum_overlap_percentage": min_overlap_percentage,
             "gate_message": f"Geographic overlap confirmed ({pct_smaller:.3f}% of the smaller footprint, {overlap_area:.6f} sq. deg).",
             "status": "validated",
+            "geometry_status": "VALID_INTERSECTION",
             "projection_status": {"source": source_projection, "reference": reference_projection},
+            "projected_source_polygon": src_proj,
+            "projected_reference_polygon": ref_proj,
+            "projected_overlap_polygon": overlap_proj,
+            "projection_debug": {"source": src_projection_debug, "reference": ref_projection_debug},
         }
 
     # Standard lat/lon space (equatorial or non-polar)
@@ -460,8 +616,11 @@ def evaluate_footprint_overlap(
             "gate_passed": False,
             "gate_message": gate_msg,
             "status": "rejected",
+            "geometry_status": "VALID_NO_INTERSECTION",
             "source_polygon": src_polygon,
             "reference_polygon": ref_polygon,
+            "projected_source_polygon": None,
+            "projected_reference_polygon": None,
             "overlap_polygon": [],
             "source_area": _polygon_area(src_polygon),
             "reference_area": _polygon_area(ref_polygon),
@@ -506,6 +665,7 @@ def evaluate_footprint_overlap(
             "minimum_overlap_percentage": min_overlap_percentage,
             "gate_message": f"Insufficient geographic overlap detected ({pct_smaller:.3f}% of the smaller footprint is below the {min_overlap_percentage:.3f}% threshold). Matching blocked.",
             "status": "insufficient_overlap",
+            "geometry_status": "VALID_INTERSECTION",
             "projection_status": {"source": source_projection, "reference": reference_projection},
         }
 
@@ -527,6 +687,7 @@ def evaluate_footprint_overlap(
         "minimum_overlap_percentage": min_overlap_percentage,
         "gate_message": f"Geographic overlap confirmed ({pct_smaller:.3f}% of the smaller footprint, {overlap_area:.6f} sq. deg).",
         "status": "validated",
+        "geometry_status": "VALID_INTERSECTION",
         "projection_status": {"source": source_projection, "reference": reference_projection},
     }
 
@@ -634,13 +795,16 @@ def render_footprint_overlap_map(
     is_polar = all(p[0] <= -60.0 for p in src_poly + ref_poly)
 
     if is_polar:
-        src_coords = [to_polar_stereographic(lat, lon) for lat, lon in src_poly]
-        ref_coords = [to_polar_stereographic(lat, lon) for lat, lon in ref_poly]
-        ov_coords = [to_polar_stereographic(lat, lon) for lat, lon in overlap_poly] if overlap_poly else []
+        src_coords = footprint_eval.get("projected_source_polygon") or []
+        ref_coords = footprint_eval.get("projected_reference_polygon") or []
+        ov_coords = footprint_eval.get("projected_overlap_polygon") or []
     else:
         src_coords = [(lon, lat) for lat, lon in src_poly]
         ref_coords = [(lon, lat) for lat, lon in ref_poly]
         ov_coords = [(lon, lat) for lat, lon in overlap_poly] if overlap_poly else []
+
+    if not src_coords or not ref_coords:
+        return None
 
     all_pts = src_coords + ref_coords
     xs = [p[0] for p in all_pts]

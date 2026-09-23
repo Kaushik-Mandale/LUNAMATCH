@@ -85,6 +85,12 @@ def test_lroc_catalog_metadata_record_for_m1438615574le():
     assert record.get("record_bytes") is None
     assert record.get("image_offset") is None
     assert record.get("sample_type") is None
+    assert record["footprint"] == {
+        "upper_left": [-88.07, 211.75],
+        "upper_right": [-88.26, 197.21],
+        "lower_left": [-88.96, 293.28],
+        "lower_right": [-89.40, 311.20],
+    }
 
 
 def test_lroc_catalog_gsd_is_not_replaced_by_derived_value():
@@ -161,6 +167,30 @@ def test_polar_overlap_areas_use_projected_geometry_not_lon_lat_bbox():
     assert result["source_area_km2"] == pytest.approx(projected_source_area)
     assert result["overlap_polygon"]
     assert all(0.0 <= point[1] < 360.0 for point in result["overlap_polygon"])
+
+
+def test_fixed_ohrc_lroc_pair_is_deterministic_and_reports_geometry_status():
+    source = {"footprint": {
+        "upper_left": [-89.199860, 222.259328],
+        "upper_right": [-89.209060, 229.728973],
+        "lower_left": [-89.908842, 110.268353],
+        "lower_right": [-89.946885, 22.453651],
+    }, "projection": "Polar stereographic"}
+    reference = {"footprint": {
+        "upper_left": [-88.07, 211.75],
+        "upper_right": [-88.26, 197.21],
+        "lower_left": [-88.96, 293.28],
+        "lower_right": [-89.40, 311.20],
+    }, "projection": "Polar stereographic"}
+    first = evaluate_footprint_overlap(source, reference)
+    second = evaluate_footprint_overlap(source, reference)
+    assert first == second
+    assert first["geometry_status"] == "VALID_INTERSECTION"
+    assert first["projected_source_polygon"]
+    assert first["projected_reference_polygon"]
+    assert first["projected_overlap_polygon"]
+    assert first["overlap_percentage_smaller"] > 0.0
+    assert first["overlap_percentage_smaller"] < 100.0
 
 
 def test_missing_reference_footprint_is_not_evaluated():
