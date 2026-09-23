@@ -1164,7 +1164,10 @@ def lroc_catalog_metadata_record(image_name: str) -> dict:
             "target": "Moon",
             "start_time": "2016-01-01T00:00:00.000Z",
             "stop_time": "2016-01-01T00:00:00.000Z",
-            "gsd_m_per_pixel": 1.72,
+            "gsd_m_per_pixel": 2.00920205325772,
+            "catalog_gsd_m_per_pixel": 2.00920205325772,
+            "derived_gsd_m_per_pixel": None,
+            "gsd_provenance": "LROC_PRODUCT_RECORD",
             "altitude_km": 50.0,
             "roll_deg": 0.0,
             "pitch_deg": 0.0,
@@ -1181,8 +1184,8 @@ def lroc_catalog_metadata_record(image_name: str) -> dict:
                 "lower_right": [-90.0, 1.0],
             },
             "dimensions": {"lines": 1024, "samples": 1024},
-            "data_type": "UNSIGNED_INTEGER",
-            "sample_bits": 8,
+            "data_type": None,
+            "sample_bits": None,
             "sample_type": None,
             "byte_order": None,
             "image_offset": None,
@@ -1192,8 +1195,8 @@ def lroc_catalog_metadata_record(image_name: str) -> dict:
             "raster_spec": {
                 "lines": 1024,
                 "samples": 1024,
-                "sample_bits": 8,
-                "dtype": "uint8",
+                "sample_bits": None,
+                "dtype": None,
                 "sample_type": None,
                 "byte_order": None,
                 "image_offset": None,
@@ -3052,12 +3055,19 @@ with metadata_expander:
         _ref_spec_dict = reference_meta.get("raster_spec")
         if reference_file is not None and _ref_spec_dict and _ref_spec_dict.get("lines"):
             try:
+                _raster_contract_complete = all(
+                    _ref_spec_dict.get(field) is not None
+                    for field in ("lines", "samples", "sample_bits", "dtype", "image_offset")
+                )
+                if not _raster_contract_complete:
+                    st.info("⏳ Raster consistency check pending: reference metadata does not declare a complete raster byte contract.")
+                    raise StopIteration
                 _spec_obj = ScientificRasterSpec(
                     lines=int(_ref_spec_dict.get("lines", 0)),
                     samples=int(_ref_spec_dict.get("samples", 0)),
-                    sample_bits=int(_ref_spec_dict.get("sample_bits") or 8),
-                    sample_type=str(_ref_spec_dict.get("sample_type") or "UNSIGNED_INTEGER"),
-                    image_offset=int(_ref_spec_dict.get("image_offset") or 0),
+                    sample_bits=int(_ref_spec_dict.get("sample_bits")),
+                    sample_type=_ref_spec_dict.get("sample_type"),
+                    image_offset=int(_ref_spec_dict.get("image_offset")),
                     product_id=str(_ref_spec_dict.get("product_id") or ""),
                 )
                 _size_check = check_file_size_consistency(len(reference_file.getvalue()), _spec_obj)
@@ -3069,6 +3079,8 @@ with metadata_expander:
                     reference_meta["valid"] = False
                 else:
                     st.info(_size_check["message"])
+            except StopIteration:
+                pass
             except Exception as _sc_err:
                 st.info(f"⏳ Raster consistency check pending metadata: {_sc_err}")
         elif reference_file is not None:
@@ -3273,8 +3285,8 @@ _scale_ratio_display = scale_ratio_display(src_gsd_val, ref_gsd_val)
 scale_ratio_val, scale_ratio_str = calculate_scale_ratio(src_gsd_val, ref_gsd_val)
 
 # Render the top header card from the canonical metadata state
-_hdr_src_gsd = f"{src_gsd_val:.4f} m/pixel" if src_gsd_val is not None else "Pending metadata"
-_hdr_ref_gsd = f"{ref_gsd_val:.4f} m/pixel" if ref_gsd_val is not None else "Pending metadata"
+_hdr_src_gsd = f"{src_gsd_val:.10f} m/pixel" if src_gsd_val is not None else "Pending metadata"
+_hdr_ref_gsd = f"{ref_gsd_val:.14f} m/pixel" if ref_gsd_val is not None else "Pending metadata"
 _hdr_scale   = _scale_ratio_display if (src_gsd_val is not None and ref_gsd_val is not None) else "Scale ratio pending"
 
 header_card_placeholder.markdown(f"""
@@ -3397,7 +3409,7 @@ with val_result_col:
     _pv_icon, _pv_title, _pv_detail = PAIR_STATUS_LABELS[pair_val_status]
     if pair_val_status == PairValidationStatus.VALID:
         st.success(f"{_pv_icon} {_pv_title}")
-    elif pair_val_status == PairValidationStatus.REJECTED:
+    elif pair_val_status in (PairValidationStatus.REJECTED, PairValidationStatus.INSUFFICIENT_OVERLAP):
         st.error(f"{_pv_icon} {_pv_title}")
     else:
         st.warning(f"{_pv_icon} {_pv_title}")
@@ -3418,8 +3430,10 @@ with st.expander("📊 Scientific Pair Summary (Metadata vs Derived Parameters)"
         st.markdown("##### AVAILABLE METADATA")
         st.markdown(f"- **Source Product ID:** `{source_meta.get('product_id') or 'Not available'}`  *(provenance: {source_status['label']})*")
         st.markdown(f"- **Reference Product ID:** `{reference_meta.get('product_id') or 'Not available'}`  *(provenance: {reference_status['label']})*")
-        st.markdown(f"- **Source Resolution (GSD):** `{f'{src_gsd_val} m/pixel' if src_gsd_val is not None else 'Not available'}`")
-        st.markdown(f"- **Reference Resolution (GSD):** `{f'{ref_gsd_val} m/pixel' if ref_gsd_val is not None else 'Not available'}`")
+        st.markdown(f"- **Source Resolution (GSD):** `{f'{src_gsd_val:.10f} m/pixel' if src_gsd_val is not None else 'Not available'}`")
+        st.markdown(f"- **Source GSD provenance:** `{source_meta.get('gsd_provenance') or source_meta.get('metadata_source') or 'Not available'}`")
+        st.markdown(f"- **Reference Resolution (GSD):** `{f'{ref_gsd_val:.14f} m/pixel' if ref_gsd_val is not None else 'Not available'}`")
+        st.markdown(f"- **Reference GSD provenance:** `{reference_meta.get('gsd_provenance') or reference_meta.get('metadata_source') or 'Not available'}`")
         st.markdown(f"- **Source Calibration:** `{source_meta.get('processing_level') or 'Not available'}`")
         st.markdown(f"- **Reference State:** `{reference_meta.get('processing_level') or 'Not available'}`")
         st.markdown(f"- **Source Sun Geometry:** Az: `{source_meta.get('sun_azimuth_deg') or '—'}°`, El: `{source_meta.get('sun_elevation_deg') or '—'}°`")
@@ -3428,8 +3442,11 @@ with st.expander("📊 Scientific Pair Summary (Metadata vs Derived Parameters)"
         st.markdown("##### DERIVED PARAMETERS")
         st.markdown(f"- **Scale Difference:** `{_scale_ratio_display}`")
         _ov_area = footprint_eval.get('overlap_area_sq_deg')
-        _ov_str = f"{_ov_area:.4f} sq. deg" if _ov_area else "Not evaluated (footprint pending)"
+        _ov_str = f"{_ov_area:.8f} sq. deg" if _ov_area else "Not evaluated (footprint pending)"
         st.markdown(f"- **Geographic Overlap Area:** `{_ov_str}`")
+        st.markdown(f"- **Intersection / source:** `{footprint_eval.get('intersection_percent_of_source', 0.0):.3f}%`")
+        st.markdown(f"- **Intersection / reference:** `{footprint_eval.get('intersection_percent_of_reference', 0.0):.3f}%`")
+        st.markdown(f"- **Intersection / smaller:** `{footprint_eval.get('intersection_percent_of_smaller', 0.0):.3f}%`")
         if source_meta.get("sun_elevation_deg") is not None and reference_meta.get("sun_elevation_deg") is not None:
             el_diff = abs(float(source_meta["sun_elevation_deg"]) - float(reference_meta["sun_elevation_deg"]))
             st.markdown(f"- **Illumination Elevation Difference:** `~{el_diff:.2f}°`")
@@ -3443,9 +3460,31 @@ with st.expander("📊 Scientific Pair Summary (Metadata vs Derived Parameters)"
         if _pre_map is not None:
             st.image(_pre_map, caption="Footprint Overlap Diagnostic", use_container_width=True)
 
+with st.expander("GEOGRAPHIC OVERLAP", expanded=False):
+    if footprint_eval.get("source_polygon") and footprint_eval.get("reference_polygon"):
+        st.markdown("**Source footprint**")
+        st.json(footprint_eval.get("source_polygon"))
+        st.markdown("**Reference footprint**")
+        st.json(footprint_eval.get("reference_polygon"))
+        st.markdown("**Intersection polygon**")
+        st.json(footprint_eval.get("overlap_polygon", []))
+        geo_c1, geo_c2, geo_c3 = st.columns(3)
+        geo_c1.metric("Source area", f"{footprint_eval.get('source_area_km2', 0.0):.6f} km²")
+        geo_c2.metric("Reference area", f"{footprint_eval.get('reference_area_km2', 0.0):.6f} km²")
+        geo_c3.metric("Intersection", f"{footprint_eval.get('overlap_area_km2', 0.0):.6f} km²")
+        st.markdown(f"- **Intersection / source:** `{footprint_eval.get('intersection_percent_of_source', 0.0):.3f}%`")
+        st.markdown(f"- **Intersection / reference:** `{footprint_eval.get('intersection_percent_of_reference', 0.0):.3f}%`")
+        st.markdown(f"- **Intersection / smaller:** `{footprint_eval.get('intersection_percent_of_smaller', 0.0):.3f}%`")
+        st.markdown(f"- **Minimum required:** `{footprint_eval.get('minimum_overlap_percentage', 0.1):.3f}%`")
+        st.markdown(f"- **Status:** `{footprint_eval.get('status', 'pending').upper()}`")
+    else:
+        st.info("Geographic overlap geometry is pending valid source and reference footprints.")
+
 if not (source_file and reference_file):
     st.info("ℹ️ **Metadata pair configured.** Upload/select the actual product files to execute processing.")
 
+si = None
+ri = None
 if source_file and reference_file:
     try:
         # Pass upload handles directly so scientific binaries are inspected by
@@ -3509,8 +3548,8 @@ scientific_ready = bool(
     and source_status["status"] not in {"INCOMPLETE", "NOT_PROVIDED"}
     and reference_status["status"] not in {"INCOMPLETE", "NOT_PROVIDED"}
     and _pid_status != "MISMATCH"
-    and footprint_eval.get("has_overlap") is True
-    and footprint_eval.get("gate_passed", False) is True
+    and pair_val_status == PairValidationStatus.VALID
+    and bool(si and ri and si.get("decoding_status") == "READY" and ri.get("decoding_status") == "READY")
     and source_projection_status.get("status") == "VALID"
     and reference_projection_status.get("status") == "VALID"
 )
@@ -3526,10 +3565,16 @@ if execution_mode == "Scientific / validated mode" and not scientific_ready:
     if _pid_status == "MISMATCH":
         st.error("🔴 RUN BLOCKED: Reference image and metadata refer to different products.")
     elif footprint_eval.get("status") == "insufficient_overlap":
-        _pct = footprint_eval.get("overlap_percentage_source", 0.0)
-        st.error(f"🔴 INSUFFICIENT OVERLAP: {_pct:.2f}% overlap is below minimum threshold (0.1%). Scientific matching blocked.")
+        _pct = footprint_eval.get("intersection_percent_of_smaller", 0.0)
+        _minimum = footprint_eval.get("minimum_overlap_percentage", 0.1)
+        st.error(
+            f"🔴 INSUFFICIENT OVERLAP: Geographic intersection {_pct:.3f}%; "
+            f"minimum required {_minimum:.3f}%. NO SCIENTIFIC MATCHING FOR THIS PAIR."
+        )
     elif footprint_eval.get("status") == "rejected":
         st.error("🔴 RUN BLOCKED: Source and reference footprints have zero geographic overlap.")
+    elif (si and si.get("decoding_status") != "READY") or (ri and ri.get("decoding_status") != "READY"):
+        st.error("🔴 RUN BLOCKED: Scientific raster decoding has not been independently verified.")
     else:
         st.error("RUN BLOCKED: Scientific mode requires source/reference metadata and confirmed geographic overlap.")
 elif execution_mode == "Experimental image-only mode":
@@ -3735,8 +3780,9 @@ if result:
             d_col4.metric("Reference Coverage", f"{_pct_r:.2f}%")
 
         if footprint_eval.get("status") == "insufficient_overlap":
-            _pct = footprint_eval.get("overlap_percentage_source", 0.0)
-            st.error(f"🔴 INSUFFICIENT OVERLAP: {_pct:.2f}% overlap is below minimum threshold (0.1%)")
+            _pct = footprint_eval.get("intersection_percent_of_smaller", 0.0)
+            _minimum = footprint_eval.get("minimum_overlap_percentage", 0.1)
+            st.error(f"🔴 INSUFFICIENT OVERLAP: {_pct:.3f}% is below the {_minimum:.3f}% minimum. NO SCIENTIFIC MATCHING FOR THIS PAIR.")
 
         src_roi, ref_roi, roi_info = extract_overlap_rois(result["source"].gray, result["reference"].gray, source_meta, reference_meta)
         roi_col1, roi_col2 = st.columns(2)

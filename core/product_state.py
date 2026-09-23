@@ -41,6 +41,7 @@ class PairValidationStatus(str, Enum):
     VALID    = "VALID"    # Footprints overlap; all required metadata present
     PENDING  = "PENDING"  # Cannot yet determine — metadata / footprint missing
     REJECTED = "REJECTED" # Both footprints known and they do NOT overlap
+    INSUFFICIENT_OVERLAP = "INSUFFICIENT_OVERLAP"  # Intersection exists but is below threshold
 
 
 # Human-readable labels used in the UI
@@ -65,6 +66,7 @@ PAIR_STATUS_LABELS = {
     PairValidationStatus.VALID:    ("🟢", "PAIR VALIDATED", "Geographic overlap confirmed."),
     PairValidationStatus.PENDING:  ("🟡", "VALIDATION PENDING", "Provide reference metadata to evaluate geographic overlap."),
     PairValidationStatus.REJECTED: ("🔴", "PAIR REJECTED", "No meaningful geographic overlap detected."),
+    PairValidationStatus.INSUFFICIENT_OVERLAP: ("🔴", "INSUFFICIENT OVERLAP", "Geographic intersection is below the configured minimum."),
 }
 
 
@@ -196,12 +198,20 @@ def compute_pair_validation(
             "Matching was not executed because the source and reference "
             "images are geographically inconsistent.",
         )
+    if eval_status == "insufficient_overlap":
+        percentage = footprint_eval.get("overlap_percentage_smaller", footprint_eval.get("overlap_fraction", 0.0) * 100.0)
+        threshold = footprint_eval.get("minimum_overlap_percentage", 0.1)
+        return (
+            PairValidationStatus.INSUFFICIENT_OVERLAP,
+            f"Geographic intersection: {percentage:.3f}% of the smaller footprint; "
+            f"minimum required: {threshold:.3f}%. Scientific matching blocked.",
+        )
     if eval_status == "validated" or footprint_eval.get("has_overlap") is True:
         area = footprint_eval.get("overlap_area_sq_deg", 0.0)
-        pct = footprint_eval.get("overlap_fraction", 0.0) * 100
+        pct = footprint_eval.get("overlap_percentage_smaller", footprint_eval.get("overlap_fraction", 0.0) * 100.0)
         return (
             PairValidationStatus.VALID,
-            f"Geographic overlap confirmed ({pct:.1f}% of smaller image, {area:.4f} sq. deg).",
+            f"Geographic overlap confirmed ({pct:.3f}% of smaller image, {area:.6f} sq. deg).",
         )
 
     # Footprints were valid but overlap engine returned an ambiguous state

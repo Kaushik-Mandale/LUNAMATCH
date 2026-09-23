@@ -1,6 +1,7 @@
 import os
 
 import numpy as np
+import pytest
 
 from core.footprint import (
     calculate_overlap_area,
@@ -9,6 +10,7 @@ from core.footprint import (
 )
 from core.pds_parser import parse_lro_pds3_label, verify_product_id
 from core.product_state import FootprintStatus, MetadataStatus, compute_footprint_status
+from core.product_state import PairValidationStatus, compute_pair_validation
 from core.scientific_reader import (
     ScientificRasterSpec,
     check_file_size_consistency,
@@ -74,13 +76,23 @@ def test_lroc_catalog_metadata_record_for_m1438615574le():
     assert record["sensor_type"] == "LROC_NAC"
     assert record["dimensions"]["lines"] > 0
     assert record["dimensions"]["samples"] > 0
-    assert record["gsd_m_per_pixel"] > 0
+    assert record["gsd_m_per_pixel"] == 2.00920205325772
+    assert record["gsd_provenance"] == "LROC_PRODUCT_RECORD"
     assert record["start_time"]
     assert record["footprint"]["upper_left"]
     assert record.get("metadata_source") == "LROC_CATALOG"
     assert record.get("record_bytes") is None
     assert record.get("image_offset") is None
     assert record.get("sample_type") is None
+
+
+def test_lroc_catalog_gsd_is_not_replaced_by_derived_value():
+    record = lroc_catalog_metadata_record("M1438615574LE.IMG")
+    assert record["catalog_gsd_m_per_pixel"] == 2.00920205325772
+    assert record["gsd_m_per_pixel"] == record["catalog_gsd_m_per_pixel"]
+    assert record.get("derived_gsd_m_per_pixel") is None
+    assert scientific_raster_spec(record).is_decodable() is False
+    assert record["gsd_m_per_pixel"] / 0.24 == pytest.approx(8.371675221907166)
 
 
 def test_file_size_consistency_states():
@@ -149,3 +161,26 @@ def test_longitude_normalization_and_overlap_area_helpers():
     assert wrapped[1] == 0.0
     polygon = [(0.0, 359.0), (0.0, 1.0), (1.0, 1.0), (1.0, 359.0)]
     assert calculate_overlap_area(polygon) > 0.0
+
+
+def test_overlap_below_threshold_is_not_pair_validated():
+    source = {"footprint": {
+        "upper_left": [0.0, 0.0], "upper_right": [0.0, 10.0],
+        "lower_right": [10.0, 10.0], "lower_left": [10.0, 0.0],
+    }, "projection": "Equirectangular"}
+    reference = {"footprint": {
+        "upper_left": [0.0, 9.998], "upper_right": [0.0, 20.0],
+        "lower_right": [10.0, 20.0], "lower_left": [10.0, 9.998],
+    }, "projection": "Equirectangular"}
+    result = evaluate_footprint_overlap(source, reference, min_overlap_percentage=0.1)
+    assert result["status"] == "insufficient_overlap"
+    assert result["gate_passed"] is False
+    assert result["overlap_percentage_smaller"] < 0.1
+    status, _ = compute_pair_validation(
+        MetadataStatus.CATALOG_METADATA,
+        MetadataStatus.CATALOG_METADATA,
+        FootprintStatus.AVAILABLE,
+        FootprintStatus.AVAILABLE,
+        result,
+    )
+    assert status == PairValidationStatus.INSUFFICIENT_OVERLAP
