@@ -7,6 +7,7 @@ from core.footprint import (
     calculate_overlap_area,
     evaluate_footprint_overlap,
     normalize_longitudes,
+    to_polar_stereographic,
 )
 from core.pds_parser import parse_lro_pds3_label, verify_product_id
 from core.product_state import FootprintStatus, MetadataStatus, compute_footprint_status
@@ -138,6 +139,28 @@ def test_longitude_wrap_polygon_overlap_is_calculated():
     assert result["has_overlap"] is True
     assert result["overlap_area"] > 0
     assert result["overlap_percentage_source"] > 0
+    assert result["intersection_area_km2"] == pytest.approx(result["overlap_area_km2"])
+
+
+def test_polar_overlap_areas_use_projected_geometry_not_lon_lat_bbox():
+    source = {"footprint": {
+        "upper_left": [-80.0, 359.0], "upper_right": [-80.0, 1.0],
+        "lower_right": [-82.0, 1.0], "lower_left": [-82.0, 359.0],
+    }, "projection": "Polar stereographic"}
+    reference = {"footprint": {
+        "upper_left": [-80.0, 0.0], "upper_right": [-80.0, 2.0],
+        "lower_right": [-82.0, 2.0], "lower_left": [-82.0, 0.0],
+    }, "projection": "Polar stereographic"}
+    result = evaluate_footprint_overlap(source, reference, min_overlap_percentage=0.1)
+    projected_source = [to_polar_stereographic(lat, lon) for lat, lon in (
+        (-80.0, 359.0), (-80.0, 1.0), (-82.0, 1.0), (-82.0, 359.0)
+    )]
+    projected_source_area = calculate_overlap_area(projected_source)
+    assert result["projection_status"]["source"]["status"] == "VALID"
+    assert result["source_area_km2"] > 0.0
+    assert result["source_area_km2"] == pytest.approx(projected_source_area)
+    assert result["overlap_polygon"]
+    assert all(0.0 <= point[1] < 360.0 for point in result["overlap_polygon"])
 
 
 def test_missing_reference_footprint_is_not_evaluated():
@@ -184,3 +207,25 @@ def test_overlap_below_threshold_is_not_pair_validated():
         result,
     )
     assert status == PairValidationStatus.INSUFFICIENT_OVERLAP
+
+
+def test_acceptance_overlap_0_095_percent_is_blocked_and_not_validated():
+    footprint_eval = {
+        "status": "insufficient_overlap",
+        "has_overlap": True,
+        "gate_passed": False,
+        "overlap_percentage_smaller": 0.095,
+        "minimum_overlap_percentage": 0.1,
+        "overlap_area_km2": 1.234567,
+    }
+    status, reason = compute_pair_validation(
+        MetadataStatus.CATALOG_METADATA,
+        MetadataStatus.CATALOG_METADATA,
+        FootprintStatus.AVAILABLE,
+        FootprintStatus.AVAILABLE,
+        footprint_eval,
+    )
+    assert status == PairValidationStatus.INSUFFICIENT_OVERLAP
+    assert "0.095%" in reason
+    assert "0.100%" in reason
+    assert status != PairValidationStatus.VALID

@@ -66,6 +66,8 @@ def from_polar_stereographic(x: float, y: float, r_moon: float = LUNAR_RADIUS_KM
     co_lat = 2.0 * math.degrees(math.atan(r / (2.0 * r_moon)))
     lat = -90.0 + co_lat
     lon = math.degrees(math.atan2(x, -y)) % 360.0
+    if math.isclose(lon, 360.0, abs_tol=1e-12):
+        lon = 0.0
     return (float(lat), float(lon))
 
 
@@ -249,7 +251,14 @@ def evaluate_footprint_overlap(
     source_projection = validate_projection(source_meta)
     reference_projection = validate_projection(reference_meta)
 
-    def metrics(source_area: float, reference_area: float, intersection_area: float) -> Dict[str, float]:
+    def metrics(
+        source_area: float,
+        reference_area: float,
+        intersection_area: float,
+        source_area_km2: Optional[float] = None,
+        reference_area_km2: Optional[float] = None,
+        intersection_area_km2: Optional[float] = None,
+    ) -> Dict[str, float]:
         deg_to_km = 1737.4 * math.pi / 180.0
         source_percent = intersection_area / max(source_area, 1e-9) * 100.0
         reference_percent = intersection_area / max(reference_area, 1e-9) * 100.0
@@ -258,8 +267,9 @@ def evaluate_footprint_overlap(
             "source_area": source_area,
             "reference_area": reference_area,
             "overlap_area": intersection_area,
-            "source_area_km2": source_area * (deg_to_km * deg_to_km),
-            "reference_area_km2": reference_area * (deg_to_km * deg_to_km),
+            "source_area_km2": source_area_km2 if source_area_km2 is not None else source_area * (deg_to_km * deg_to_km),
+            "reference_area_km2": reference_area_km2 if reference_area_km2 is not None else reference_area * (deg_to_km * deg_to_km),
+            "intersection_area_km2": intersection_area_km2 if intersection_area_km2 is not None else intersection_area * (deg_to_km * deg_to_km),
             "overlap_percentage_source": source_percent,
             "overlap_percentage_reference": reference_percent,
             "overlap_percentage_smaller": smaller_percent,
@@ -376,7 +386,7 @@ def evaluate_footprint_overlap(
                 "source_polygon": src_polygon,
                 "reference_polygon": ref_polygon,
                 "overlap_polygon": overlap_polygon,
-                **overlap_metrics,
+                **metrics(source_area, reference_area, 0.0, source_area_km2, reference_area_km2, 0.0),
                 "intersection_bounds": inter_bounds,
                 "source_bounds": src_bounds,
                 "reference_bounds": ref_bounds,
@@ -384,6 +394,7 @@ def evaluate_footprint_overlap(
                 "minimum_overlap_percentage": min_overlap_percentage,
                 "gate_message": f"Insufficient geographic overlap detected ({pct_smaller:.3f}% of the smaller footprint is below the {min_overlap_percentage:.3f}% threshold). Matching blocked.",
                 "status": "insufficient_overlap",
+                "projection_status": {"source": source_projection, "reference": reference_projection},
             }
 
         return {
@@ -404,6 +415,7 @@ def evaluate_footprint_overlap(
             "minimum_overlap_percentage": min_overlap_percentage,
             "gate_message": f"Geographic overlap confirmed ({pct_smaller:.3f}% of the smaller footprint, {overlap_area:.6f} sq. deg).",
             "status": "validated",
+            "projection_status": {"source": source_projection, "reference": reference_projection},
         }
 
     # Standard lat/lon space (equatorial or non-polar)
@@ -465,7 +477,12 @@ def evaluate_footprint_overlap(
     source_area = float(_polygon_area(src_polygon))
     reference_area = float(_polygon_area(ref_polygon))
     overlap_fraction = float(overlap_area / max(min(source_area, reference_area), 1e-9))
-    overlap_metrics = metrics(source_area, reference_area, overlap_area)
+    overlap_metrics = metrics(
+        source_area,
+        reference_area,
+        overlap_area,
+        intersection_area_km2=overlap_area_km2,
+    )
     pct_src = overlap_metrics["overlap_percentage_source"]
     pct_ref = overlap_metrics["overlap_percentage_reference"]
     pct_smaller = overlap_metrics["overlap_percentage_smaller"]
@@ -489,6 +506,7 @@ def evaluate_footprint_overlap(
             "minimum_overlap_percentage": min_overlap_percentage,
             "gate_message": f"Insufficient geographic overlap detected ({pct_smaller:.3f}% of the smaller footprint is below the {min_overlap_percentage:.3f}% threshold). Matching blocked.",
             "status": "insufficient_overlap",
+            "projection_status": {"source": source_projection, "reference": reference_projection},
         }
 
     return {
@@ -509,6 +527,7 @@ def evaluate_footprint_overlap(
         "minimum_overlap_percentage": min_overlap_percentage,
         "gate_message": f"Geographic overlap confirmed ({pct_smaller:.3f}% of the smaller footprint, {overlap_area:.6f} sq. deg).",
         "status": "validated",
+        "projection_status": {"source": source_projection, "reference": reference_projection},
     }
 
 
