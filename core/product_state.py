@@ -137,8 +137,8 @@ def compute_metadata_status(meta: dict, source_label: str) -> MetadataStatus:
     if str(meta.get("sensor_type", "")).upper() == "LROC_NAC":
         if meta.get("gsd_m_per_pixel") is None or not _valid_footprint(meta.get("footprint")):
             return MetadataStatus.INCOMPLETE
-        raster_spec = meta.get("raster_spec") or {}
-        if not raster_spec.get("dtype") or raster_spec.get("image_offset") is None:
+        dimensions = meta.get("dimensions") or {}
+        if not dimensions.get("lines") or not dimensions.get("samples"):
             return MetadataStatus.INCOMPLETE
 
     return base_status

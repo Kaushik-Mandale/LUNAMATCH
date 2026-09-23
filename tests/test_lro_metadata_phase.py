@@ -17,6 +17,7 @@ from core.scientific_reader import (
     persist_product,
     scientific_raster_spec,
 )
+from app_v3 import lroc_catalog_metadata_record
 
 
 def lro_label(product_id="M1438615574LE", pointer=1):
@@ -65,6 +66,21 @@ def test_lro_product_id_verification():
     result = verify_product_id("M1438615574LE.IMG", "OTHER_PRODUCT")
     assert result["status"] == "MISMATCH"
     assert "different products" in result["message"]
+
+
+def test_lroc_catalog_metadata_record_for_m1438615574le():
+    record = lroc_catalog_metadata_record("M1438615574LE.IMG")
+    assert record["product_id"] == "M1438615574LE"
+    assert record["sensor_type"] == "LROC_NAC"
+    assert record["dimensions"]["lines"] > 0
+    assert record["dimensions"]["samples"] > 0
+    assert record["gsd_m_per_pixel"] > 0
+    assert record["start_time"]
+    assert record["footprint"]["upper_left"]
+    assert record.get("metadata_source") == "LROC_CATALOG"
+    assert record.get("record_bytes") is None
+    assert record.get("image_offset") is None
+    assert record.get("sample_type") is None
 
 
 def test_file_size_consistency_states():
