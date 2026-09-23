@@ -6,8 +6,148 @@ Implements:
 2. Strict overlap gate: rejects non-overlapping pairs with scientific rationale.
 3. Common geographic overlap extraction into pixel ROIs for source and reference.
 """
+from dataclasses import asdict, dataclass
+import math
 from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
+
+LUNAR_RADIUS_KM = 1737.4
+LUNAR_RADIUS_PROVENANCE = "STANDARD_LUNAR_CONSTANT"
+
+
+def validate_projection(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate projection identity and expose lunar-radius provenance."""
+    projection = str(meta.get("projection") or "").strip().lower() if isinstance(meta, dict) else ""
+    if not projection:
+        return {"status": "NOT_PROVIDED", "projection": None, "provenance": "UNKNOWN", "message": "Projection metadata is not available."}
+    if not any(token in projection for token in ("polar", "stereographic", "equirectangular")):
+        return {"status": "UNSUPPORTED", "projection": meta.get("projection"), "provenance": "PRODUCT_METADATA", "message": f"Projection '{meta.get('projection')}' is not supported by the lunar footprint engine."}
+    radius = meta.get("planetary_radius_km") or meta.get("lunar_radius_km") or LUNAR_RADIUS_KM
+    provenance = "PRODUCT_METADATA" if meta.get("planetary_radius_km") or meta.get("lunar_radius_km") else LUNAR_RADIUS_PROVENANCE
+    return {"status": "VALID", "projection": meta.get("projection"), "provenance": provenance, "radius_km": float(radius), "message": "Projection is supported; lunar radius provenance is explicit."}
+
+
+@dataclass
+class FootprintValidationResult:
+    source_polygon: List[Tuple[float, float]]
+    reference_polygon: List[Tuple[float, float]]
+    overlap_polygon: List[Tuple[float, float]]
+    source_area: float
+    reference_area: float
+    overlap_area: float
+    overlap_percentage_source: float
+    overlap_percentage_reference: float
+    status: str
+    gate_passed: bool
+    gate_message: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def to_polar_stereographic(lat: float, lon: float, r_moon: float = LUNAR_RADIUS_KM) -> Tuple[float, float]:
+    """Project lunar South Polar latitude and longitude to planar coordinates (x, y) in km.
+
+    Conformal South Polar Stereographic projection centered at the South Pole (-90 deg).
+    """
+    co_lat = max(0.0, 90.0 + lat)
+    r = 2.0 * r_moon * math.tan(math.radians(co_lat / 2.0))
+    rad_lon = math.radians(lon)
+    x = r * math.sin(rad_lon)
+    y = -r * math.cos(rad_lon)
+    return (float(x), float(y))
+
+
+def from_polar_stereographic(x: float, y: float, r_moon: float = LUNAR_RADIUS_KM) -> Tuple[float, float]:
+    """Inverse project from planar coordinates (x, y) in km to (lat, lon)."""
+    r = math.hypot(x, y)
+    if r < 1e-12:
+        return (-90.0, 0.0)
+    co_lat = 2.0 * math.degrees(math.atan(r / (2.0 * r_moon)))
+    lat = -90.0 + co_lat
+    lon = math.degrees(math.atan2(x, -y)) % 360.0
+    return (float(lat), float(lon))
+
+
+def normalize_longitudes(values: List[float]) -> List[float]:
+    """Normalize longitudes into the [0, 360) domain while preserving local continuity."""
+    normalized = []
+    for value in values:
+        if value is None:
+            normalized.append(None)
+            continue
+        wrapped = float(value) % 360.0
+        normalized.append(wrapped)
+    return normalized
+
+
+def calculate_overlap_area(polygon: List[Tuple[float, float]]) -> float:
+    """Return the polygon area in square degrees for a simple (lat, lon) footprint polygon."""
+    if len(polygon) < 3:
+        return 0.0
+    return abs(_polygon_area(polygon))
+
+
+def _polygon_area(polygon: List[Tuple[float, float]]) -> float:
+    if len(polygon) < 3:
+        return 0.0
+    return abs(sum(
+        polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+        - polygon[(index + 1) % len(polygon)][0] * polygon[index][1]
+        for index in range(len(polygon))
+    ) / 2.0)
+
+
+def _signed_polygon_area(polygon: List[Tuple[float, float]]) -> float:
+    if len(polygon) < 3:
+        return 0.0
+    return sum(
+        polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+        - polygon[(index + 1) % len(polygon)][0] * polygon[index][1]
+        for index in range(len(polygon))
+    ) / 2.0
+
+
+def _clip_polygon(subject, clip):
+    """Sutherland-Hodgman clipping for the convex four-corner footprints."""
+    if not subject or not clip:
+        return []
+    orientation = 1.0 if _signed_polygon_area(clip) >= 0 else -1.0
+
+    def inside(point, start, end):
+        cross = (end[0] - start[0]) * (point[1] - start[1]) - (end[1] - start[1]) * (point[0] - start[0])
+        return orientation * cross >= -1e-9
+
+    def intersection(first, second, start, end):
+        x1, y1 = first
+        x2, y2 = second
+        x3, y3 = start
+        x4, y4 = end
+        denominator = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(denominator) < 1e-12:
+            return second
+        factor = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denominator
+        return [x1 + factor * (x2 - x1), y1 + factor * (y2 - y1)]
+
+    output = list(subject)
+    for index, clip_start in enumerate(clip):
+        clip_end = clip[(index + 1) % len(clip)]
+        input_polygon = output
+        output = []
+        if not input_polygon:
+            break
+        previous = input_polygon[-1]
+        for current in input_polygon:
+            current_inside = inside(current, clip_start, clip_end)
+            previous_inside = inside(previous, clip_start, clip_end)
+            if current_inside:
+                if not previous_inside:
+                    output.append(intersection(previous, current, clip_start, clip_end))
+                output.append(current)
+            elif previous_inside:
+                output.append(intersection(previous, current, clip_start, clip_end))
+            previous = current
+    return output
 
 
 def get_footprint_bounds(meta: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
@@ -94,17 +234,20 @@ def _polygons_intersect(first, second) -> bool:
     return _point_in_polygon(first[0], second) or _point_in_polygon(second[0], first)
 
 
-def evaluate_footprint_overlap(source_meta: Dict[str, Any], reference_meta: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_footprint_overlap(
+    source_meta: Dict[str, Any],
+    reference_meta: Dict[str, Any],
+    min_overlap_percentage: float = 0.1,
+) -> Dict[str, Any]:
     """Evaluate geographic footprint overlap between source and reference imagery.
 
-    Enforces the strict gate rule:
-    If no overlap:
-        gate_message = "No meaningful geographic overlap detected.
-Matching was not executed because the source and reference
-images are geographically inconsistent."
+    Supports polar stereographic projection for lunar South Polar footprints (lat <= -60 deg).
+    Enforces strict gating with configurable minimum overlap threshold.
     """
     src_polygon = _footprint_polygon(source_meta)
     ref_polygon = _footprint_polygon(reference_meta)
+    source_projection = validate_projection(source_meta)
+    reference_projection = validate_projection(reference_meta)
 
     if src_polygon is None or ref_polygon is None:
         return {
@@ -112,16 +255,141 @@ images are geographically inconsistent."
             "has_overlap": None,
             "overlap": None,
             "overlap_area_sq_deg": 0.0,
+            "overlap_area_km2": 0.0,
             "intersection_bounds": None,
             "source_bounds": None,
             "reference_bounds": None,
             "gate_passed": False,
             "gate_message": "Geographic overlap cannot yet be evaluated; one or both footprints are unavailable.",
             "status": "pending",
+            "projection_status": {"source": source_projection, "reference": reference_projection},
         }
 
-    # Move the reference polygon onto the longitude branch nearest the source
-    # polygon so 0/360-degree crossings do not become artificial gaps.
+    # Detect if footprints are near the lunar South Pole
+    is_polar = all(p[0] <= -60.0 for p in src_polygon + ref_polygon)
+
+    if is_polar:
+        # Polar stereographic planar space (km)
+        if source_projection["status"] != "VALID" or reference_projection["status"] != "VALID":
+            return {
+                "available": True, "has_overlap": None, "overlap": None,
+                "overlap_area_sq_deg": 0.0, "overlap_area_km2": 0.0,
+                "intersection_bounds": None, "source_bounds": None, "reference_bounds": None,
+                "gate_passed": False,
+                "gate_message": "Projection validation is incomplete; geographic overlap was not evaluated.",
+                "status": "geometry_error",
+                "projection_status": {"source": source_projection, "reference": reference_projection},
+            }
+        src_radius = source_projection.get("radius_km", LUNAR_RADIUS_KM)
+        ref_radius = reference_projection.get("radius_km", LUNAR_RADIUS_KM)
+        src_proj = [to_polar_stereographic(lat, lon, src_radius) for lat, lon in src_polygon]
+        ref_proj = [to_polar_stereographic(lat, lon, ref_radius) for lat, lon in ref_polygon]
+        has_overlap = _polygons_intersect(src_proj, ref_proj)
+
+        src_bounds = (
+            min(point[0] for point in src_polygon), max(point[0] for point in src_polygon),
+            min(point[1] for point in src_polygon), max(point[1] for point in src_polygon),
+        )
+        ref_bounds = (
+            min(point[0] for point in ref_polygon), max(point[0] for point in ref_polygon),
+            min(point[1] for point in ref_polygon), max(point[1] for point in ref_polygon),
+        )
+
+        source_area_km2 = float(_polygon_area(src_proj))
+        reference_area_km2 = float(_polygon_area(ref_proj))
+        deg_to_km = 1737.4 * math.pi / 180.0
+        km2_to_sqdeg = 1.0 / (deg_to_km * deg_to_km)
+        source_area = source_area_km2 * km2_to_sqdeg
+        reference_area = reference_area_km2 * km2_to_sqdeg
+
+        if not has_overlap:
+            gate_msg = (
+                "No meaningful geographic overlap detected.\n"
+                "Matching was not executed because the source and reference\n"
+                "images are geographically inconsistent."
+            )
+            return {
+                "available": True,
+                "has_overlap": False,
+                "overlap": False,
+                "overlap_area_sq_deg": 0.0,
+                "overlap_area_km2": 0.0,
+                "intersection_bounds": None,
+                "source_bounds": src_bounds,
+                "reference_bounds": ref_bounds,
+                "gate_passed": False,
+                "gate_message": gate_msg,
+                "status": "rejected",
+                "source_polygon": src_polygon,
+                "reference_polygon": ref_polygon,
+                "overlap_polygon": [],
+                "source_area": source_area,
+                "reference_area": reference_area,
+                "overlap_area": 0.0,
+                "overlap_percentage_source": 0.0,
+                "overlap_percentage_reference": 0.0,
+            }
+
+        overlap_proj = _clip_polygon(src_proj, ref_proj)
+        overlap_area_km2 = float(_polygon_area(overlap_proj))
+        overlap_area = overlap_area_km2 * km2_to_sqdeg
+        overlap_polygon = [from_polar_stereographic(x, y, src_radius) for x, y in overlap_proj]
+        overlap_fraction = float(overlap_area / max(min(source_area, reference_area), 1e-9))
+        pct_src = overlap_area / max(source_area, 1e-9) * 100.0
+        pct_ref = overlap_area / max(reference_area, 1e-9) * 100.0
+
+        inter_lats = [p[0] for p in overlap_polygon] if overlap_polygon else []
+        inter_lons = [p[1] for p in overlap_polygon] if overlap_polygon else []
+        inter_bounds = (min(inter_lats), max(inter_lats), min(inter_lons), max(inter_lons)) if inter_lats else None
+
+        if max(pct_src, pct_ref) < min_overlap_percentage:
+            return {
+                "available": True,
+                "has_overlap": True,
+                "overlap": False,
+                "overlap_area_sq_deg": overlap_area,
+                "overlap_area_km2": overlap_area_km2,
+                "overlap_fraction": overlap_fraction,
+                "source_polygon": src_polygon,
+                "reference_polygon": ref_polygon,
+                "overlap_polygon": overlap_polygon,
+                "source_area": source_area,
+                "reference_area": reference_area,
+                "overlap_area": overlap_area,
+                "overlap_percentage_source": pct_src,
+                "overlap_percentage_reference": pct_ref,
+                "intersection_bounds": inter_bounds,
+                "source_bounds": src_bounds,
+                "reference_bounds": ref_bounds,
+                "gate_passed": False,
+                "gate_message": f"Insufficient geographic overlap detected ({max(pct_src, pct_ref):.2f}% coverage is below the {min_overlap_percentage}% threshold). Matching blocked.",
+                "status": "insufficient_overlap",
+            }
+
+        return {
+            "available": True,
+            "has_overlap": True,
+            "overlap": True,
+            "overlap_area_sq_deg": overlap_area,
+            "overlap_area_km2": overlap_area_km2,
+            "overlap_fraction": overlap_fraction,
+            "source_polygon": src_polygon,
+            "reference_polygon": ref_polygon,
+            "overlap_polygon": overlap_polygon,
+            "source_area": source_area,
+            "reference_area": reference_area,
+            "overlap_area": overlap_area,
+            "overlap_percentage_source": pct_src,
+            "overlap_percentage_reference": pct_ref,
+            "intersection_bounds": inter_bounds,
+            "source_bounds": src_bounds,
+            "reference_bounds": ref_bounds,
+            "gate_passed": True,
+            "gate_message": f"Geographic overlap confirmed ({overlap_fraction*100:.1f}% common coverage, {overlap_area:.4f} sq. deg).",
+            "status": "validated",
+        }
+
+    # Standard lat/lon space (equatorial or non-polar)
     src_center = sum(point[1] for point in src_polygon) / len(src_polygon)
     ref_center = sum(point[1] for point in ref_polygon) / len(ref_polygon)
     longitude_shift = round((src_center - ref_center) / 360.0) * 360.0
@@ -145,9 +413,6 @@ images are geographically inconsistent."
     inter_min_lon = max(s_min_lon, r_min_lon)
     inter_max_lon = min(s_max_lon, r_max_lon)
 
-    lat_overlap = inter_max_lat - inter_min_lat
-    lon_overlap = inter_max_lon - inter_min_lon
-
     if not has_overlap:
         gate_msg = (
             "No meaningful geographic overlap detected.\n"
@@ -159,25 +424,72 @@ images are geographically inconsistent."
             "has_overlap": False,
             "overlap": False,
             "overlap_area_sq_deg": 0.0,
+            "overlap_area_km2": 0.0,
             "intersection_bounds": None,
             "source_bounds": src_bounds,
             "reference_bounds": ref_bounds,
             "gate_passed": False,
             "gate_message": gate_msg,
             "status": "rejected",
+            "source_polygon": src_polygon,
+            "reference_polygon": ref_polygon,
+            "overlap_polygon": [],
+            "source_area": _polygon_area(src_polygon),
+            "reference_area": _polygon_area(ref_polygon),
+            "overlap_area": 0.0,
+            "overlap_percentage_source": 0.0,
+            "overlap_percentage_reference": 0.0,
         }
 
-    overlap_area = float(max(lat_overlap, 0.0) * max(lon_overlap, 0.0))
-    src_area = max((s_max_lat - s_min_lat) * (s_max_lon - s_min_lon), 1e-9)
-    ref_area = max((r_max_lat - r_min_lat) * (r_max_lon - r_min_lon), 1e-9)
-    overlap_fraction = float(overlap_area / min(src_area, ref_area))
+    overlap_polygon = _clip_polygon(src_polygon, ref_polygon)
+    overlap_area = float(_polygon_area(overlap_polygon))
+    deg_to_km = 1737.4 * math.pi / 180.0
+    overlap_area_km2 = float(overlap_area * (deg_to_km * deg_to_km))
+    source_area = float(_polygon_area(src_polygon))
+    reference_area = float(_polygon_area(ref_polygon))
+    overlap_fraction = float(overlap_area / max(min(source_area, reference_area), 1e-9))
+    pct_src = overlap_area / max(source_area, 1e-9) * 100.0
+    pct_ref = overlap_area / max(reference_area, 1e-9) * 100.0
+
+    if max(pct_src, pct_ref) < min_overlap_percentage:
+        return {
+            "available": True,
+            "has_overlap": True,
+            "overlap": False,
+            "overlap_area_sq_deg": overlap_area,
+            "overlap_area_km2": overlap_area_km2,
+            "overlap_fraction": overlap_fraction,
+            "source_polygon": src_polygon,
+            "reference_polygon": ref_polygon,
+            "overlap_polygon": overlap_polygon,
+            "source_area": source_area,
+            "reference_area": reference_area,
+            "overlap_area": overlap_area,
+            "overlap_percentage_source": pct_src,
+            "overlap_percentage_reference": pct_ref,
+            "intersection_bounds": (inter_min_lat, inter_max_lat, inter_min_lon, inter_max_lon),
+            "source_bounds": src_bounds,
+            "reference_bounds": ref_bounds,
+            "gate_passed": False,
+            "gate_message": f"Insufficient geographic overlap detected ({max(pct_src, pct_ref):.2f}% coverage is below the {min_overlap_percentage}% threshold). Matching blocked.",
+            "status": "insufficient_overlap",
+        }
 
     return {
         "available": True,
         "has_overlap": True,
         "overlap": True,
         "overlap_area_sq_deg": overlap_area,
+        "overlap_area_km2": overlap_area_km2,
         "overlap_fraction": overlap_fraction,
+        "source_polygon": src_polygon,
+        "reference_polygon": ref_polygon,
+        "overlap_polygon": overlap_polygon,
+        "source_area": source_area,
+        "reference_area": reference_area,
+        "overlap_area": overlap_area,
+        "overlap_percentage_source": pct_src,
+        "overlap_percentage_reference": pct_ref,
         "intersection_bounds": (inter_min_lat, inter_max_lat, inter_min_lon, inter_max_lon),
         "source_bounds": src_bounds,
         "reference_bounds": ref_bounds,
@@ -262,3 +574,124 @@ def extract_overlap_rois(
     }
 
     return src_roi, ref_roi, details
+
+
+def render_footprint_overlap_map(
+    footprint_eval: Dict[str, Any],
+    width: int = 700,
+    height: int = 420,
+) -> Optional[Any]:
+    """Render a visual footprint overlap diagnostic graphic using PIL.
+
+    Renders:
+    - Source footprint polygon (cyan)
+    - Reference footprint polygon (magenta)
+    - Overlap polygon (green shaded)
+    - Coordinate grid and diagnostic legend
+    """
+    from PIL import Image, ImageDraw
+
+    src_poly = footprint_eval.get("source_polygon")
+    ref_poly = footprint_eval.get("reference_polygon")
+    overlap_poly = footprint_eval.get("overlap_polygon")
+
+    if not src_poly or not ref_poly:
+        return None
+
+    # Determine if polar stereographic projection should be used
+    is_polar = all(p[0] <= -60.0 for p in src_poly + ref_poly)
+
+    if is_polar:
+        src_coords = [to_polar_stereographic(lat, lon) for lat, lon in src_poly]
+        ref_coords = [to_polar_stereographic(lat, lon) for lat, lon in ref_poly]
+        ov_coords = [to_polar_stereographic(lat, lon) for lat, lon in overlap_poly] if overlap_poly else []
+    else:
+        src_coords = [(lon, lat) for lat, lon in src_poly]
+        ref_coords = [(lon, lat) for lat, lon in ref_poly]
+        ov_coords = [(lon, lat) for lat, lon in overlap_poly] if overlap_poly else []
+
+    all_pts = src_coords + ref_coords
+    xs = [p[0] for p in all_pts]
+    ys = [p[1] for p in all_pts]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    span_x = max(max_x - min_x, 1e-4)
+    span_y = max(max_y - min_y, 1e-4)
+
+    pad_x = span_x * 0.15
+    pad_y = span_y * 0.15
+    min_x -= pad_x
+    max_x += pad_x
+    min_y -= pad_y
+    max_y += pad_y
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+
+    margin_left = 60
+    margin_right = 40
+    margin_top = 50
+    margin_bottom = 50
+    draw_w = width - margin_left - margin_right
+    draw_h = height - margin_top - margin_bottom
+
+    def to_canvas(x, y):
+        cx = margin_left + int((x - min_x) / span_x * draw_w)
+        cy = height - margin_bottom - int((y - min_y) / span_y * draw_h)
+        return (cx, cy)
+
+    src_px = [to_canvas(x, y) for x, y in src_coords]
+    ref_px = [to_canvas(x, y) for x, y in ref_coords]
+    ov_px = [to_canvas(x, y) for x, y in ov_coords] if ov_coords else []
+
+    # Base background: deep space dark slate
+    img = Image.new("RGBA", (width, height), (15, 23, 42, 255))
+    draw = ImageDraw.Draw(img)
+
+    # Subtle grid lines
+    grid_steps = 4
+    for i in range(grid_steps + 1):
+        gx = margin_left + int(i * draw_w / grid_steps)
+        gy = margin_top + int(i * draw_h / grid_steps)
+        draw.line([(gx, margin_top), (gx, height - margin_bottom)], fill=(30, 41, 59, 180), width=1)
+        draw.line([(margin_left, gy), (width - margin_right, gy)], fill=(30, 41, 59, 180), width=1)
+
+    # Frame
+    draw.rectangle(
+        [(margin_left, margin_top), (width - margin_right, height - margin_bottom)],
+        outline=(51, 65, 85, 255),
+        width=1,
+    )
+
+    # Draw Source footprint (Cyan outline)
+    draw.polygon(src_px, outline=(6, 182, 212, 255), width=3)
+
+    # Draw Reference footprint (Magenta outline)
+    draw.polygon(ref_px, outline=(236, 72, 153, 255), width=3)
+
+    # Draw Overlap polygon (Green shaded overlay with alpha)
+    if ov_px and len(ov_px) >= 3:
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ov_draw = ImageDraw.Draw(overlay)
+        ov_draw.polygon(ov_px, fill=(34, 197, 94, 90), outline=(16, 185, 129, 255), width=2)
+        img = Image.alpha_composite(img, overlay)
+        draw = ImageDraw.Draw(img)
+
+    # Title & Coordinate System Banner
+    cs_label = "Lunar South Polar Stereographic (km)" if is_polar else "Lunar Coordinates (Lon/Lat  deg)"
+    draw.text((margin_left, 16), f"Footprint Overlap Diagnostic -- {cs_label}", fill=(241, 245, 249, 255))
+
+    # Legend at bottom
+    leg_y = height - 32
+    # Cyan: Source
+    draw.rectangle([(margin_left, leg_y + 4), (margin_left + 16, leg_y + 12)], outline=(6, 182, 212, 255), width=2)
+    draw.text((margin_left + 22, leg_y), "Source (OHRC)", fill=(6, 182, 212, 255))
+    # Magenta: Reference
+    draw.rectangle([(margin_left + 160, leg_y + 4), (margin_left + 176, leg_y + 12)], outline=(236, 72, 153, 255), width=2)
+    draw.text((margin_left + 182, leg_y), "Reference (LRO NAC)", fill=(236, 72, 153, 255))
+    # Green: Overlap
+    draw.rectangle([(margin_left + 360, leg_y + 4), (margin_left + 376, leg_y + 12)], fill=(34, 197, 94, 120), outline=(16, 185, 129, 255), width=2)
+    draw.text((margin_left + 382, leg_y), "Overlap Region", fill=(34, 197, 94, 255))
+
+    return img
+

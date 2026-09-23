@@ -27,8 +27,8 @@ from core.data_models import (
     ImageMetadataRecord,
     FootprintCoordinates,
 )
-from core.pds_parser import parse_lro_pds3_label, read_scientific_binary
-from core.footprint import evaluate_footprint_overlap, extract_overlap_rois, compute_overlap_pixel_roi
+from core.pds_parser import parse_lro_pds3_label, read_scientific_binary, verify_product_id
+from core.footprint import evaluate_footprint_overlap, extract_overlap_rois, compute_overlap_pixel_roi, render_footprint_overlap_map, validate_projection
 from core.spatial import balance_correspondences_spatially
 from core.registration import (
     create_alpha_overlay,
@@ -56,6 +56,8 @@ from core.product_state import (
 )
 from core.scientific_reader import (
     ProductType,
+    ScientificRasterSpec,
+    check_file_size_consistency,
     classify_product,
     classify_product_display_label,
     inspect_scientific_product,
@@ -304,6 +306,12 @@ def _valid_corner_footprint(footprint: dict) -> bool:
 
 def geographic_overlap(source_meta: dict, reference_meta: dict) -> dict:
     """Compatibility wrapper around the canonical wrap-aware validator."""
+    # Preserve the legacy pure-geometry helper contract for callers that pass
+    # only corner coordinates. The scientific app gate uses evaluate_footprint_overlap
+    # directly and therefore still requires explicit projection metadata.
+    if not source_meta.get("projection") and not reference_meta.get("projection"):
+        source_meta = {**source_meta, "projection": "Equirectangular"}
+        reference_meta = {**reference_meta, "projection": "Equirectangular"}
     return evaluate_footprint_overlap(source_meta, reference_meta)
 def _find_elem(root, ns_paths: list, local_names: list | None = None):
     for path in ns_paths:
@@ -1129,6 +1137,39 @@ def parse_metadata_xml(data: bytes | str, name: str = "") -> dict:
     if "pds_version_id" in sample or "record_type" in sample or "lroc" in sample or ("lines" in sample and "^image" in sample):
         return parse_lro_pds3_label(data, name)
     return parse_chandrayaan2_pds4_xml(data, name)
+
+
+def associate_reference_label(reference_file, reference_meta_file) -> bool:
+    """Associate a .LBL/.XML file with an uploaded .IMG using product ID or filename stem.
+
+    This enables the required LRO reference-product workflow without hard-coding one
+    specific product id.
+    """
+    if reference_file is None or reference_meta_file is None:
+        return False
+
+    img_name = (getattr(reference_file, "name", "") or "").strip()
+    lbl_name = (getattr(reference_meta_file, "name", "") or "").strip()
+    if not img_name or not lbl_name:
+        return False
+
+    img_base = os.path.splitext(os.path.basename(img_name))[0].upper()
+    lbl_base = os.path.splitext(os.path.basename(lbl_name))[0].upper()
+    if img_base and lbl_base and (img_base == lbl_base or img_base in lbl_base or lbl_base in img_base):
+        return True
+
+    try:
+        from core.pds_parser import _normalise_product_id
+        parsed = parse_metadata_xml(reference_meta_file.getvalue(), lbl_name)
+    except Exception:
+        return False
+
+    ref_pid = parsed.get("product_id")
+    if ref_pid:
+        img_pid = _normalise_product_id(os.path.basename(img_name))
+        if img_pid and img_pid == _normalise_product_id(ref_pid):
+            return True
+    return False
 
 
 def merge_metadata(manual: dict, xml_meta: dict) -> dict:
@@ -2704,7 +2745,7 @@ if _src_hash_now and st.session_state.get("_src_file_hash") != _src_hash_now:
 
 # If reference file changed, clear stale reference state and results
 if _ref_hash_now and st.session_state.get("_ref_file_hash") != _ref_hash_now:
-    for _k in ("_ref_meta", "_ref_meta_source", "_ref_manual_meta", "result", "comp_result"):
+    for _k in ("_ref_meta", "_ref_meta_source", "_ref_manual_meta", "_ref_catalog_meta", "result", "comp_result"):
         st.session_state.pop(_k, None)
     st.session_state["_ref_file_hash"] = _ref_hash_now
 
@@ -2713,7 +2754,7 @@ if _src_hash_now is None and st.session_state.get("_src_file_hash"):
     for _k in ("_src_meta", "_src_meta_source", "_src_file_hash", "result", "comp_result"):
         st.session_state.pop(_k, None)
 if _ref_hash_now is None and st.session_state.get("_ref_file_hash"):
-    for _k in ("_ref_meta", "_ref_meta_source", "_ref_manual_meta", "_ref_file_hash", "result", "comp_result"):
+    for _k in ("_ref_meta", "_ref_meta_source", "_ref_manual_meta", "_ref_catalog_meta", "_ref_file_hash", "result", "comp_result"):
         st.session_state.pop(_k, None)
 
 metadata_expander = st.expander("IMAGE METADATA", expanded=True)
@@ -2802,17 +2843,39 @@ with metadata_expander:
                 f"{len(reference_file.getvalue())/(1024**2):.1f} MB"
             )
 
+        # ── Option A: Upload Reference Label / Metadata
+        st.markdown("**Option A: Upload .LBL / XML Label**")
         reference_meta_file = st.file_uploader(
             "Upload reference metadata/XML/LBL",
             type=["xml", "txt", "lbl"],
             key="reference_meta_xml",
         )
 
+        reference_catalog_file = st.file_uploader(
+            "Option B: Upload verified LROC catalog metadata (JSON)",
+            type=["json"],
+            key="reference_catalog_json",
+            help="Catalog values are labeled as catalog metadata and are never treated as embedded in the image.",
+        )
+
         if reference_meta_file is not None:
             reference_xml_bytes = reference_meta_file.getvalue()
             reference_meta = parse_metadata_xml(reference_xml_bytes, reference_meta_file.name)
             st.caption(f"Label: **{reference_meta_file.name}** ({len(reference_xml_bytes):,} bytes)")
+            if reference_file is not None and not associate_reference_label(reference_file, reference_meta_file):
+                st.warning("⚠️ Uploaded label does not match the selected reference image by product ID / filename stem; verification is still required.")
             reference_meta_source = "UPLOADED_LABEL"
+        elif reference_catalog_file is not None:
+            try:
+                reference_meta = json.loads(reference_catalog_file.getvalue().decode("utf-8"))
+                reference_meta["metadata_source"] = "LROC_CATALOG"
+                reference_meta_source = "CATALOG_METADATA"
+                st.caption(f"Catalog record: **{reference_catalog_file.name}**")
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                reference_meta = empty_metadata_template()
+                reference_meta["validation_errors"] = [f"Catalog metadata could not be read: {exc}"]
+                reference_meta_source = "CATALOG_METADATA"
+                st.error("Catalog metadata could not be read.")
         elif is_pair_001:
             # DEMO MODE only
             reference_meta = PAIR_001_REFERENCE.to_canonical_dict()
@@ -2826,6 +2889,50 @@ with metadata_expander:
             # REAL MODE — no metadata provided yet
             reference_meta = empty_metadata_template()
             reference_meta_source = "NOT_PROVIDED"
+
+        # Product ID Verification and Raster Size Consistency Badges
+        _ref_pid = reference_meta.get("product_id")
+        _pid_check = verify_product_id(
+            reference_file.name if reference_file else None,
+            _ref_pid
+        )
+        if reference_file is not None and _ref_pid and _ref_pid != "UNKNOWN":
+            reference_meta["product_id_verification"] = _pid_check
+            if _pid_check["status"] in {"VERIFIED", "MATCH"}:
+                st.success(_pid_check["message"])
+            elif _pid_check["status"] == "MISMATCH":
+                st.error(_pid_check["message"])
+                reference_meta.setdefault("validation_errors", []).append(_pid_check["message"])
+                reference_meta["valid"] = False
+            else:
+                st.info(_pid_check["message"])
+        elif reference_file is not None:
+            st.info("⏳ Product ID verification pending reference metadata")
+
+        _ref_spec_dict = reference_meta.get("raster_spec")
+        if reference_file is not None and _ref_spec_dict and _ref_spec_dict.get("lines"):
+            try:
+                _spec_obj = ScientificRasterSpec(
+                    lines=int(_ref_spec_dict.get("lines", 0)),
+                    samples=int(_ref_spec_dict.get("samples", 0)),
+                    sample_bits=int(_ref_spec_dict.get("sample_bits") or 8),
+                    sample_type=str(_ref_spec_dict.get("sample_type") or "UNSIGNED_INTEGER"),
+                    image_offset=int(_ref_spec_dict.get("image_offset") or 0),
+                    product_id=str(_ref_spec_dict.get("product_id") or ""),
+                )
+                _size_check = check_file_size_consistency(len(reference_file.getvalue()), _spec_obj)
+                if _size_check["status"] == "CONSISTENT":
+                    st.success(_size_check["message"])
+                elif _size_check["status"] == "MISMATCH":
+                    st.error(_size_check["message"])
+                    reference_meta.setdefault("validation_errors", []).append(_size_check["message"])
+                    reference_meta["valid"] = False
+                else:
+                    st.info(_size_check["message"])
+            except Exception as _sc_err:
+                st.info(f"⏳ Raster consistency check pending metadata: {_sc_err}")
+        elif reference_file is not None:
+            st.info("⏳ Raster consistency check pending metadata")
 
         reference_status = metadata_status(reference_meta, reference_meta_source)
         _ref_icon   = reference_status["icon"]
@@ -2923,10 +3030,22 @@ with metadata_expander:
                         step=0.01, key="man_ref_inc"
                     )
                 with _man_c3:
+                    _man_projection = st.text_input(
+                        "Projection", value=str(reference_meta.get("projection") or ""), key="man_ref_projection"
+                    )
                     _man_alt = st.number_input(
                         "Altitude (km)", min_value=0.0, max_value=1000.0,
                         value=float(reference_meta.get("altitude_km") or 0.0),
                         step=0.1, key="man_ref_alt"
+                    )
+                    _man_sample_bits = st.text_input(
+                        "Sample bits", value=str(reference_meta.get("sample_bits") or ""), key="man_ref_sample_bits"
+                    )
+                    _man_sample_type = st.text_input(
+                        "Sample type", value=str(reference_meta.get("sample_type") or ""), key="man_ref_sample_type"
+                    )
+                    _man_image_offset = st.text_input(
+                        "Image offset (bytes)", value=str(reference_meta.get("image_offset") or ""), key="man_ref_image_offset"
                     )
                 st.markdown("**Corner coordinates** (latitude, longitude)")
                 _fp_c1, _fp_c2 = st.columns(2)
@@ -2952,26 +3071,47 @@ with metadata_expander:
                         "mission":       reference_meta.get("mission") or "Lunar Reference",
                         "sensor_type":   reference_meta.get("sensor_type") or reference_sensor or "Unknown",
                         "processing_level": reference_meta.get("processing_level") or "Unknown",
+                        "projection": _man_projection.strip() or None,
                         "gsd_m_per_pixel":  float(_man_gsd),
                         "altitude_km":      float(_man_alt) if _man_alt else None,
                         "solar_incidence_deg": float(_man_inc) if _man_inc else None,
                         "sun_elevation_deg":   (90.0 - float(_man_inc)) if _man_inc else None,
                         "dimensions":    {"lines": int(_man_lines), "samples": int(_man_samples)},
+                        "sample_bits": int(_man_sample_bits) if _man_sample_bits.strip().isdigit() else None,
+                        "sample_type": _man_sample_type.strip() or None,
+                        "image_offset": int(_man_image_offset) if _man_image_offset.strip().isdigit() else None,
+                        "raster_spec": {
+                            "lines": int(_man_lines),
+                            "samples": int(_man_samples),
+                            "sample_bits": int(_man_sample_bits) if _man_sample_bits.strip().isdigit() else None,
+                            "sample_type": _man_sample_type.strip() or None,
+                            "image_offset": int(_man_image_offset) if _man_image_offset.strip().isdigit() else None,
+                            "product_id": _man_pid or None,
+                        },
                         "footprint": {
                             "upper_left":  [_man_ul_lat, _man_ul_lon],
                             "upper_right": [_man_ur_lat, _man_ur_lon],
                             "lower_left":  [_man_ll_lat, _man_ll_lon],
                             "lower_right": [_man_lr_lat, _man_lr_lon],
                         },
+                        "metadata_source": "USER_PROVIDED",
+                        "provenance": "USER_PROVIDED",
                         "valid": True,
                         "validation_errors": [],
-                        "validation_warnings": ["Metadata manually entered — not parsed from product label."],
+                        "validation_warnings": ["Metadata manually entered by user — provenance USER_PROVIDED."],
                     }
                     st.session_state["_ref_manual_meta"] = _man_built
                     # Invalidate any previous pair result
                     st.session_state.pop("result", None)
                     st.session_state.pop("comp_result", None)
                     st.rerun()
+
+                if "_ref_manual_meta" in st.session_state:
+                    if st.button("🗑️ Clear Manual Metadata", key="btn_clear_man_ref"):
+                        st.session_state.pop("_ref_manual_meta", None)
+                        st.session_state.pop("result", None)
+                        st.session_state.pop("comp_result", None)
+                        st.rerun()
 
 # ──────────────────────────────────────────────────────────────────────────
 # PAIR VALIDATION & SCIENTIFIC SUMMARY GATE
@@ -2980,6 +3120,8 @@ with metadata_expander:
 # PENDING is shown whenever any required information is missing.
 # ──────────────────────────────────────────────────────────────────────────
 footprint_eval = evaluate_footprint_overlap(source_meta, reference_meta)
+source_projection_status = validate_projection(source_meta)
+reference_projection_status = validate_projection(reference_meta)
 
 # GSD values — only from actual metadata, never from demo fallback
 src_gsd_val = source_meta.get("gsd_m_per_pixel")
@@ -3026,6 +3168,37 @@ pair_val_status, pair_val_reason = compute_pair_validation(
     ref_fp_status,
     footprint_eval,
 )
+
+# Single canonical experiment snapshot consumed by the validation, summary,
+# and execution gate surfaces. File hashes keep replacement state distinct.
+experiment = {
+    "source": {
+        "product": source_file.name if source_file else None,
+        "file_state": "READY" if source_file else "NOT_UPLOADED",
+        "metadata": source_meta,
+        "metadata_status": source_status["status"],
+        "metadata_source": source_meta_source,
+        "footprint": source_meta.get("footprint"),
+        "footprint_status": src_fp_status.value,
+    },
+    "reference": {
+        "product": reference_file.name if reference_file else None,
+        "file_state": "READY" if reference_file else "NOT_UPLOADED",
+        "metadata": reference_meta,
+        "metadata_status": reference_status["status"],
+        "metadata_source": reference_meta_source,
+        "raster_status": "READY" if reference_file else "NOT_UPLOADED",
+        "footprint": reference_meta.get("footprint"),
+        "footprint_status": ref_fp_status.value,
+    },
+    "pair_validation": {
+        "status": pair_val_status.value,
+        "reason": pair_val_reason,
+        "footprint_evaluation": footprint_eval,
+        "scale_ratio": scale_ratio_val,
+    },
+}
+st.session_state["experiment"] = experiment
 
 st.markdown("#### 🔬 Pair Validation")
 
@@ -3125,19 +3298,34 @@ with st.expander("📊 Scientific Pair Summary (Metadata vs Derived Parameters)"
         st.markdown(f"- **Sensor Domain Relation:** `{'Cross-Mission (Chandrayaan-2 → Lunar Reference)' if is_cross_sensor else 'Same-Sensor Modality'}`")
         st.markdown(f"- **Pair Validation Status:** `{pair_val_status.value}`")
         st.markdown(f"- **Overlap Gate:** `{footprint_eval.get('status', 'pending').upper()}`")
+    if footprint_eval.get("source_polygon") and footprint_eval.get("reference_polygon"):
+        _pre_map = render_footprint_overlap_map(footprint_eval)
+        if _pre_map is not None:
+            st.image(_pre_map, caption="Footprint Overlap Diagnostic", use_container_width=True)
 
 if not (source_file and reference_file):
     st.info("ℹ️ **Metadata pair configured.** Upload/select the actual product files to execute processing.")
 
 if source_file and reference_file:
     try:
-        si = inspect_image(source_file.getvalue(), source_file.name, metadata=source_meta)
-        ri = inspect_image(reference_file.getvalue(), reference_file.name, metadata=reference_meta)
+        # Pass upload handles directly so scientific binaries are inspected by
+        # metadata only; no 252 MB byte copy is created for the .IMG file.
+        si = inspect_image(source_file, source_file.name, metadata=source_meta)
+        ri = inspect_image(reference_file, reference_file.name, metadata=reference_meta)
         with st.expander("Image metadata (raster inspection)", expanded=False):
             if ri.get("decoding_status") == "PENDING_METADATA":
                 st.info(f"ℹ️ **Reference Raster:** {ri.get('message')}")
             if si.get("decoding_status") == "PENDING_METADATA":
                 st.info(f"ℹ️ **Source Raster:** {si.get('message')}")
+            for _label, _inspection in (("Source", si), ("Reference", ri)):
+                _consistency = _inspection.get("file_size_consistency")
+                if _consistency:
+                    st.caption(
+                        f"{_label} raster consistency: **{_consistency['status']}** | "
+                        f"expected {_consistency.get('expected_raster_bytes') or 'pending'} bytes | "
+                        f"actual {_consistency.get('actual_file_bytes', 'unknown')} bytes | "
+                        f"offset {_consistency.get('image_offset', 'pending')}"
+                    )
             st.json({"source": si, "reference": ri})
     except Exception as exc:
         logger.exception("Image inspection exception")
@@ -3175,11 +3363,16 @@ execution_mode = st.radio(
     horizontal=True,
     help="Image-only mode does not claim geographic overlap, geographic consistency, or metadata-based scale validation.",
 )
+_pid_status = _pid_check.get("status") if "_pid_check" in locals() else "UNKNOWN"
 scientific_ready = bool(
     source_file and reference_file
     and source_status["status"] not in {"INCOMPLETE", "NOT_PROVIDED"}
     and reference_status["status"] not in {"INCOMPLETE", "NOT_PROVIDED"}
+    and _pid_status != "MISMATCH"
     and footprint_eval.get("has_overlap") is True
+    and footprint_eval.get("gate_passed", False) is True
+    and source_projection_status.get("status") == "VALID"
+    and reference_projection_status.get("status") == "VALID"
 )
 
 ref_ptype = classify_product(reference_file.name if reference_file else "")
@@ -3190,7 +3383,15 @@ ref_can_decode = not ref_is_science_binary or bool(reference_meta.get("dimension
 image_only_ready = bool(source_file and reference_file and ref_can_decode)
 
 if execution_mode == "Scientific / validated mode" and not scientific_ready:
-    st.error("RUN BLOCKED: Scientific mode requires source/reference metadata and confirmed geographic overlap.")
+    if _pid_status == "MISMATCH":
+        st.error("🔴 RUN BLOCKED: Reference image and metadata refer to different products.")
+    elif footprint_eval.get("status") == "insufficient_overlap":
+        _pct = footprint_eval.get("overlap_percentage_source", 0.0)
+        st.error(f"🔴 INSUFFICIENT OVERLAP: {_pct:.2f}% overlap is below minimum threshold (0.1%). Scientific matching blocked.")
+    elif footprint_eval.get("status") == "rejected":
+        st.error("🔴 RUN BLOCKED: Source and reference footprints have zero geographic overlap.")
+    else:
+        st.error("RUN BLOCKED: Scientific mode requires source/reference metadata and confirmed geographic overlap.")
 elif execution_mode == "Experimental image-only mode":
     if not ref_can_decode:
         st.warning(
@@ -3378,8 +3579,25 @@ if result:
             st.image(ref_disp, use_container_width=True)
             st.caption(f"Preview: {ref_diag['shape'][1]}×{ref_diag['shape'][0]} px | Full Resolution: {result['reference'].info.get('width')}×{result['reference'].info.get('height')} px")
 
-        # Overlap ROI Display
-        st.markdown("#### Geographic Overlap Region of Interest (ROI)")
+        # Overlap Footprint Diagnostic & ROI Display
+        st.markdown("#### Geographic Footprint & Overlap Diagnostic")
+        ov_map_img = render_footprint_overlap_map(footprint_eval)
+        if ov_map_img is not None:
+            st.image(ov_map_img, use_container_width=True)
+            d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+            _ov_sqdeg = footprint_eval.get("overlap_area_sq_deg", 0.0)
+            _ov_km2 = footprint_eval.get("overlap_area_km2", 0.0)
+            _pct_s = footprint_eval.get("overlap_percentage_source", 0.0)
+            _pct_r = footprint_eval.get("overlap_percentage_reference", 0.0)
+            d_col1.metric("Overlap Area (sq deg)", f"{_ov_sqdeg:.4f}°²")
+            d_col2.metric("Overlap Area (km²)", f"{_ov_km2:.2f} km²")
+            d_col3.metric("Source Coverage", f"{_pct_s:.2f}%")
+            d_col4.metric("Reference Coverage", f"{_pct_r:.2f}%")
+
+        if footprint_eval.get("status") == "insufficient_overlap":
+            _pct = footprint_eval.get("overlap_percentage_source", 0.0)
+            st.error(f"🔴 INSUFFICIENT OVERLAP: {_pct:.2f}% overlap is below minimum threshold (0.1%)")
+
         src_roi, ref_roi, roi_info = extract_overlap_rois(result["source"].gray, result["reference"].gray, source_meta, reference_meta)
         roi_col1, roi_col2 = st.columns(2)
         with roi_col1:

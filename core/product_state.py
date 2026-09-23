@@ -131,6 +131,16 @@ def compute_metadata_status(meta: dict, source_label: str) -> MetadataStatus:
     if not dims.get("lines") or not dims.get("samples"):
         return MetadataStatus.INCOMPLETE
 
+    # LRO scientific validation needs the declared raster contract, measured
+    # resolution, and real corner coordinates. A recognized PDS record alone
+    # must not unlock geographic validation.
+    if str(meta.get("sensor_type", "")).upper() == "LROC_NAC":
+        if meta.get("gsd_m_per_pixel") is None or not _valid_footprint(meta.get("footprint")):
+            return MetadataStatus.INCOMPLETE
+        raster_spec = meta.get("raster_spec") or {}
+        if not raster_spec.get("dtype") or raster_spec.get("image_offset") is None:
+            return MetadataStatus.INCOMPLETE
+
     return base_status
 
 
