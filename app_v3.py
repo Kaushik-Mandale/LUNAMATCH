@@ -72,6 +72,10 @@ _src = _src.replace(
     "compute_file_hash(reference_file.getvalue()) if reference_file is not None else None",
     "(_light_id(reference_file) if reference_file is not None else None)",
 )
+_src = _src.replace(
+    "check_file_size_consistency(len(reference_file.getvalue()), _spec_obj)",
+    "check_file_size_consistency((getattr(reference_file, 'size', None) or len(reference_file.getvalue())), _spec_obj)",
+)
 
 # Inject lightweight helpers + URL loader right after streamlit import block
 _INJECT = '''
@@ -129,16 +133,15 @@ _NEW_UPLOADER = '''    reference_file = st.file_uploader(
             "Reference product URL",
             value=st.session_state.get("_ref_url_input", ""),
             key="_ref_url_input",
-            placeholder="https://…/M1438615574LE.IMG",
+            placeholder="https://\u2026/M1438615574LE.IMG",
         )
         _fetch = st.button("Fetch reference on server", key="_ref_url_fetch")
         if _fetch and _ref_url and download_url_product is not None:
             try:
-                _bar = st.progress(0, text="Downloading reference on server…")
+                _bar = st.progress(0, text="Downloading reference on server\u2026")
                 def _cb(n):
-                    # indeterminate-ish progress from bytes (cap display at 250 MB)
-                    _bar.progress(min(n / (252 * 1024 * 1024), 0.99), text=f"Downloaded {n/1024/1024:.1f} MB…")
-                with st.spinner("Server downloading reference product…"):
+                    _bar.progress(min(n / (252 * 1024 * 1024), 0.99), text=f"Downloaded {n/1024/1024:.1f} MB\u2026")
+                with st.spinner("Server downloading reference product\u2026"):
                     reference_file = download_url_product(_ref_url, progress_cb=_cb)
                 _bar.progress(1.0, text="Download complete")
                 st.session_state["_ref_url_file"] = reference_file
@@ -151,8 +154,5 @@ _NEW_UPLOADER = '''    reference_file = st.file_uploader(
 
 if _OLD_UPLOADER in _src:
     _src = _src.replace(_OLD_UPLOADER, _NEW_UPLOADER, 1)
-else:
-    # Fallback: still provide helpers even if uploader text drifted
-    pass
 
 exec(compile(_src, "app_v3.py", "exec"), globals())
