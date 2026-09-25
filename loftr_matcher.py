@@ -9,6 +9,7 @@ Memory-oriented for Streamlit Cloud:
 - Default max_side 768 (override via caller)
 - CPU thread caps to reduce peak RSS
 - Explicit gc after heavy work
+- LUNAMATCH_DISABLE_LOFTR=1 skips torch/kornia entirely
 """
 from __future__ import annotations
 
@@ -23,7 +24,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Cap BLAS / torch threads early (safe no-ops if already set by host)
 for _k, _v in (
     ("OMP_NUM_THREADS", "1"),
     ("MKL_NUM_THREADS", "1"),
@@ -36,13 +36,13 @@ for _k, _v in (
 _LOFTR_MODEL = None
 _LOFTR_DEVICE = None
 _LOFTR_PRETRAINED = "outdoor"
-
-# Cloud-safe default; callers may raise for local high-RAM runs
 DEFAULT_LOFTR_MAX_SIDE = 768
 
 
 def is_loftr_available() -> Tuple[bool, str]:
     """Check if torch and kornia with LoFTR are available."""
+    if os.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":
+        return False, "LoFTR disabled (LUNAMATCH_DISABLE_LOFTR=1) to prevent Cloud OOM."
     try:
         import torch  # noqa: F401
         import kornia  # noqa: F401
@@ -53,7 +53,6 @@ def is_loftr_available() -> Tuple[bool, str]:
 
 
 def get_loftr_device() -> str:
-    """Return 'cuda' if CUDA is available and functional, otherwise 'cpu'."""
     try:
         import torch
         if torch.cuda.is_available():
@@ -66,14 +65,14 @@ def get_loftr_device() -> str:
 def load_loftr_model(
     device_str: Optional[str] = None, pretrained: str = "outdoor"
 ):
-    """Load and cache pretrained LoFTR model (once per process)."""
     global _LOFTR_MODEL, _LOFTR_DEVICE, _LOFTR_PRETRAINED
+    if os.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":
+        raise RuntimeError("LoFTR disabled (LUNAMATCH_DISABLE_LOFTR=1)")
     import torch
     from kornia.feature import LoFTR
 
     if device_str is None:
         device_str = get_loftr_device()
-
     device = torch.device(device_str)
 
     if (
@@ -98,7 +97,6 @@ def load_loftr_model(
 
 
 def unload_loftr_model() -> None:
-    """Drop cached model to free RAM (call after pipeline on low-memory hosts)."""
     global _LOFTR_MODEL, _LOFTR_DEVICE, _LOFTR_PRETRAINED
     _LOFTR_MODEL = None
     _LOFTR_DEVICE = None
@@ -117,15 +115,10 @@ def prepare_image_for_loftr(
     mask: Optional[np.ndarray] = None,
     max_side: int = DEFAULT_LOFTR_MAX_SIDE,
 ) -> Tuple[Any, float, float, Tuple[int, int], Tuple[int, int]]:
-    """
-    Prepare a 2D grayscale image for LoFTR:
-    resize within max_side, dims multiples of 8, float32 [0,1] tensor.
-    """
     import torch
 
     orig_h, orig_w = img.shape[:2]
     max_side = max(64, int(max_side))
-
     scale = min(1.0, float(max_side) / max(orig_h, orig_w, 1))
     target_w = max(8, int(round(orig_w * scale)))
     target_h = max(8, int(round(orig_h * scale)))
@@ -147,14 +140,9 @@ def prepare_image_for_loftr(
         else:
             norm = np.zeros((target_h, target_w), dtype=np.float32)
 
-    if resized is not img and resized is not norm:
-        del resized
-
     scale_x = orig_w / float(target_w)
     scale_y = orig_h / float(target_h)
-
     tensor = torch.from_numpy(np.ascontiguousarray(norm)).float().unsqueeze(0).unsqueeze(0)
-    del norm
     return tensor, scale_x, scale_y, (orig_h, orig_w), (target_h, target_w)
 
 
@@ -167,12 +155,10 @@ def loftr_match(
     max_side: int = DEFAULT_LOFTR_MAX_SIDE,
     device_str: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute LoFTR inference with explicit tensor cleanup for low-RAM hosts."""
     import torch
 
     start_time = time.perf_counter()
     max_side = max(64, int(max_side))
-
     model, device = load_loftr_model(device_str=device_str)
 
     t0, sx0, sy0, orig_shape0, work_shape0 = prepare_image_for_loftr(
@@ -181,7 +167,6 @@ def loftr_match(
     t1, sx1, sy1, orig_shape1, work_shape1 = prepare_image_for_loftr(
         reference_gray, reference_mask, max_side=max_side
     )
-
     t0 = t0.to(device)
     t1 = t1.to(device)
     input_dict = {"image0": t0, "image1": t1}
@@ -234,7 +219,6 @@ def loftr_match(
         ix0 = np.clip(np.rint(pts0[:, 0]).astype(int), 0, w0 - 1)
         iy0 = np.clip(np.rint(pts0[:, 1]).astype(int), 0, h0 - 1)
         valid_mask &= source_mask[iy0, ix0] > 0
-
     if reference_mask is not None:
         h1, w1 = reference_mask.shape[:2]
         ix1 = np.clip(np.rint(pts1[:, 0]).astype(int), 0, w1 - 1)
@@ -244,7 +228,6 @@ def loftr_match(
     conf_mask = (confidence >= min_confidence) & valid_mask
     selected_indices = np.where(conf_mask)[0]
     selected_indices = selected_indices[np.argsort(-confidence[selected_indices])]
-
     correspondences = [
         (
             (float(pts0[idx, 0]), float(pts0[idx, 1])),
@@ -253,7 +236,6 @@ def loftr_match(
         )
         for idx in selected_indices
     ]
-
     del kpts0, kpts1, confidence, pts0, pts1, valid_mask, conf_mask
     gc.collect()
 
