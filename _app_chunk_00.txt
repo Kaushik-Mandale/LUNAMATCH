@@ -1,0 +1,306 @@
+import io
+import json
+import logging
+import math
+import re
+import time
+import gc
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
+import rasterio
+import streamlit as st
+
+# Streamlit Cloud memory guards (CPU thread caps reduce peak RSS)
+import os as _os
+for _k, _v in (
+    ("OMP_NUM_THREADS", "1"),
+    ("MKL_NUM_THREADS", "1"),
+    ("OPENBLAS_NUM_THREADS", "1"),
+    ("NUMEXPR_NUM_THREADS", "1"),
+    ("TORCH_NUM_THREADS", "1"),
+):
+    _os.environ.setdefault(_k, _v)
+from PIL import Image
+from rasterio.enums import Resampling
+from rasterio.io import MemoryFile
+
+import loftr_matcher
+import iirs_preprocessing
+from core.data_models import (
+    PAIR_001_CONFIG,
+    PAIR_001_SOURCE,
+    PAIR_001_REFERENCE,
+    calculate_scale_ratio,
+    ImageMetadataRecord,
+    FootprintCoordinates,
+)
+from core.pds_parser import _normalise_product_id, parse_lro_pds3_label, read_scientific_binary, verify_product_id
+from core.footprint import evaluate_footprint_overlap, extract_overlap_rois, compute_overlap_pixel_roi, render_footprint_overlap_map, validate_projection
+from core.spatial import balance_correspondences_spatially
+from core.registration import (
+    create_alpha_overlay,
+    create_checkerboard_comparison,
+    draw_inlier_outlier_matches,
+    warp_source_to_reference,
+)
+from core.evaluation import (
+    compute_reprojection_rmse,
+    compile_evaluation_report,
+    build_method_comparison_table,
+)
+from core.product_state import (
+    MetadataStatus,
+    FootprintStatus,
+    PairValidationStatus,
+    METADATA_STATUS_LABELS,
+    FOOTPRINT_STATUS_LABELS,
+    PAIR_STATUS_LABELS,
+    compute_file_hash,
+    compute_metadata_status,
+    compute_footprint_status,
+    compute_pair_validation,
+    scale_ratio_display,
+)
+from core.scientific_reader import (
+    ProductType,
+    ScientificRasterSpec,
+    check_file_size_consistency,
+    classify_product,
+    classify_product_display_label,
+    inspect_scientific_product,
+    load_scientific_preview,
+    load_product,
+    get_raster_shape,
+    get_raster_dtype,
+)
+from experiments.manager import ExperimentManager
+
+logger = logging.getLogger("lunamatch_v3")
+
+st.set_page_config(page_title="LunaMatch V3", page_icon="🌙", layout="wide")
+
+st.markdown("""
+<style>
+    .block-container {
+        max-width: 1400px;
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+    }
+    .stImage img {
+        max-height: 440px;
+        object-fit: contain;
+        border-radius: 6px;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.35rem;
+        font-weight: 600;
+    }
+    .pair-card {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+    }
+    .scale-badge {
+        background: #1e3a8a;
+        color: #93c5fd;
+        padding: 0.2rem 0.6rem;
+        border-radius: 4px;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+SENSORS = ["OHRC", "TMC", "IIRS", "LROC_NAC", "Unknown"]
+SENSORS_UI = ["Auto Detect", "OHRC", "TMC-2", "IIRS", "LROC NAC"]
+
+SOURCE_MISSIONS = ["Chandrayaan-2"]
+SOURCE_SENSORS_UI = ["OHRC", "TMC-2", "IIRS", "Auto Detect"]
+
+REFERENCE_MISSIONS = [
+    "Lunar Reconnaissance Orbiter (LRO)",
+    "SELENE (Kaguya)",
+    "Other Lunar Reference",
+    "Chandrayaan-2 (Cross-Sensor Testing)",
+]
+REFERENCE_SENSORS_UI = [
+    "LROC NAC",
+    "Terrain Camera (TC)",
+    "Multiband Imager (MI)",
+    "Other Lunar Reference",
+    "Auto Detect",
+    "OHRC",
+    "TMC-2",
+    "IIRS",
+]
+
+# Canonical sensor tokens
+_TMC_TOKENS = {"TMC", "TMC-2", "TMC2"}
+_LRO_TOKENS = {"LRO", "LROC", "LROC NAC", "LROC_NAC", "NAC", "LRO / LROC NAC"}
+
+
+def _canonical_sensor(sensor_ui: str) -> str:
+    """Normalise UI sensor label to the canonical pipeline token.
+
+    - 'TMC-2' -> 'TMC'  (keeps test contracts that compare against 'TMC')
+    - 'LROC NAC' / 'LRO' -> 'LROC_NAC'
+    - 'Auto Detect' -> 'Unknown' (resolved later from metadata / filename)
+    - Everything else is returned as-is.
+    """
+    s = (sensor_ui or "").strip().upper()
+    if s in {"TMC-2", "TMC2"}:
+        return "TMC"
+    if s in {"LROC NAC", "LROC_NAC", "NAC", "LRO", "LRO / LROC NAC", "LUNAR RECONNAISSANCE ORBITER"}:
+        return "LROC_NAC"
+    if s == "AUTO DETECT":
+        return "Unknown"
+    return s if s else "Unknown"
+
+
+def detect_sensor_from_filename(name: str) -> str:
+    """Infer sensor from product filename patterns.
+
+    ch2_iir* -> 'IIRS'
+    ch2_ohr* -> 'OHRC'
+    ch2_tmc* -> 'TMC'
+    m1* / nac* / lro* -> 'LROC_NAC'
+    Returns 'Unknown' when no pattern matches.
+    """
+    lname = (name or "").lower()
+    if "ch2_iir" in lname or "iirs" in lname:
+        return "IIRS"
+    if "ch2_ohr" in lname or "ohrc" in lname:
+        return "OHRC"
+    if "ch2_tmc" in lname or "tmc" in lname:
+        return "TMC"
+    if "m1" in lname or "nac" in lname or "lro" in lname or "lroc" in lname:
+        return "LROC_NAC"
+    return "Unknown"
+
+
+def classify_product_file(name: str) -> str:
+    """Classify an uploaded file without treating a preview as science data."""
+    if not name:
+        return "UNKNOWN"
+    return classify_product_display_label(name)
+
+
+def metadata_status(meta: dict, source: str) -> dict:
+    """Return an explicit metadata lifecycle state dict for UI and gating.
+
+    Uses the MetadataStatus enum for reliable status comparisons.
+    """
+    enum_status = compute_metadata_status(meta, source)
+    icon, label, detail = METADATA_STATUS_LABELS.get(
+        enum_status, ("?", str(enum_status.value), "")
+    )
+    return {
+        "status":      enum_status.value,  # string for legacy dict-key comparisons
+        "enum_status": enum_status,
+        "source":      source,
+        "label":       label,
+        "icon":        icon,
+        "detail":      detail,
+    }
+
+
+
+@dataclass
+class WorkingImage:
+    gray: np.ndarray
+    structure: np.ndarray
+    gradient: np.ndarray
+    mask: np.ndarray
+    to_original: np.ndarray
+    info: dict
+
+
+METADATA_KEYS = [
+    "latitude", "longitude", "resolution_gsd", "altitude", "sun_azimuth",
+    "sun_elevation", "solar_incidence", "roll", "pitch", "yaw",
+    "footprint_corners", "sensor_type", "processing_level",
+    "image_width", "image_height", "projection",
+    "observation_start_time", "observation_stop_time",
+]
+
+METADATA_DISPLAY = {
+    "latitude": "Latitude",
+    "longitude": "Longitude",
+    "resolution_gsd": "Resolution / GSD",
+    "altitude": "Altitude",
+    "sun_azimuth": "Sun Azimuth",
+    "sun_elevation": "Sun Elevation",
+    "solar_incidence": "Solar Incidence",
+    "roll": "Roll",
+    "pitch": "Pitch",
+    "yaw": "Yaw",
+    "footprint_corners": "Image Footprint / Corners",
+    "sensor_type": "Sensor Type",
+    "processing_level": "Processing Level",
+    "image_width": "Image Width",
+    "image_height": "Image Height",
+    "projection": "Projection",
+    "observation_start_time": "Observation Start Time",
+    "observation_stop_time": "Observation Stop Time",
+}
+
+NS = {
+    "pds": "http://pds.nasa.gov/pds4/pds/v1",
+    "isda": "https://isda.issdc.gov.in/pds4/isda/v1",
+}
+
+
+def is_tiff(name: str) -> bool:
+    return name.lower().endswith((".tif", ".tiff"))
+
+
+def normalize_key(key: str) -> str:
+    text = key.strip().replace(" ", "_").replace("/", "_").replace("-", "_").replace(".", "_")
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
+    text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.lower()
+
+
+def _local_tag(elem) -> str:
+    return elem.tag.split("}")[-1] if elem is not None else ""
+
+
+def _parse_float(value, default=None):
+    if value is None:
+        return default
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        cleaned = (
+            text.replace("km", "")
+            .replace("m/pixel", "")
+            .replace("m", "")
+            .replace("deg", "")
+            .replace("°", "")
+            .replace("um", "")
+            .replace("mm", "")
+            .strip()
+        )
+        return float(cleaned)
+    except Exception:
+        return default
+
+
+def _parse_int(value, default=None):
+    if value is None:
+        return default
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        return int(float(text))
+    except Exception:
+        return default
