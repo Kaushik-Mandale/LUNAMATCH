@@ -30,7 +30,6 @@ _URL = (
 with urllib.request.urlopen(_URL, timeout=60) as _resp:
     _src = _resp.read().decode("utf-8")
 
-# Defaults
 _src = _src.replace("max_side=2048, feature_count=12000,", "max_side=768, feature_count=3000,", 1)
 _src = _src.replace("[1024, 1600, 2048, 3072, 4096], value=2048", "[512, 768, 1024, 1536], value=768", 1)
 _src = _src.replace(
@@ -73,7 +72,6 @@ _src = _src.replace(
     1,
 )
 
-# Full cross-sensor block -> SIFT when LoFTR unavailable (fixes NoneType subscript)
 _NEW_CROSS = '''
             # CROSS-SENSOR: SIFT when LoFTR disabled/unavailable (Cloud-safe)
             if (not loftr_avail) or os.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":
@@ -122,21 +120,15 @@ _NEW_CROSS = '''
 '''
 
 _src, _n = re.subn(
-    r'[ \t]*# CROSS-SENSOR BRANCH.*?actual_matcher = "LoFTR"\n'
+    r'# CROSS-SENSOR BRANCH[\s\S]*?actual_matcher = "LoFTR"\n'
     r'[ \t]*matcher_note = \([\s\S]*?\)\n',
     _NEW_CROSS.lstrip("\n"),
     _src,
     count=1,
 )
 if _n != 1:
-    # Fallback: replace only the raise so pipeline does not hard-fail; SIFT path via second guard
-    _src = _src.replace(
-        'raise RuntimeError(f"LoFTR dependency unavailable: {loftr_err}")',
-        'pass  # LoFTR unavailable — use SIFT path below',
-        1,
-    )
+    raise RuntimeError(f"Cloud bootstrap failed to patch cross-sensor block (matches={_n})")
 
-# Inject light helpers + force is_loftr_available off when disabled
 _INJECT = '''
 import os as _os_helper
 try:
