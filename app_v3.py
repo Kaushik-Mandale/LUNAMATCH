@@ -36,8 +36,8 @@ _src = _src.replace(
     1,
 )
 _src = _src.replace(
-    '[1024, 1600, 2048, 3072, 4096], value=2048',
-    '[512, 768, 1024, 1536, 2048], value=1024',
+    "[1024, 1600, 2048, 3072, 4096], value=2048",
+    "[512, 768, 1024, 1536, 2048], value=1024",
     1,
 )
 _src = _src.replace(
@@ -49,6 +49,21 @@ _src = _src.replace(
     "feature_count = 12000\n",
     "feature_count = 5000\n",
     1,
+)
+
+# Avoid reading entire large scientific binaries into RAM just to show a size caption.
+# Streamlit UploadedFile exposes .size; fall back only when missing.
+_src = _src.replace(
+    "len(source_file.getvalue()) / (1024 ** 2)",
+    "(getattr(source_file, 'size', None) or len(source_file.getvalue())) / (1024 ** 2)",
+)
+_src = _src.replace(
+    "len(reference_file.getvalue()) / (1024 ** 2)",
+    "(getattr(reference_file, 'size', None) or len(reference_file.getvalue())) / (1024 ** 2)",
+)
+_src = _src.replace(
+    "len(reference_file.getvalue())/(1024**2)",
+    "(getattr(reference_file, 'size', None) or len(reference_file.getvalue()))/(1024**2)",
 )
 
 exec(compile(_src, "app_v3.py", "exec"), globals())
