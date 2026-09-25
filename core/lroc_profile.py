@@ -17,6 +17,13 @@ from typing import Any, Dict, Optional
 
 LROC_NAC_EDR_PDS3_PROFILE_ID = "LROC_NAC_EDR_PDS3"
 
+# Verified archive dimensions for known LROC NAC EDR products (not placeholders).
+# Used when catalog metadata carries incorrect/placeholder lines×samples.
+_VERIFIED_LROC_NAC_EDR_DIMENSIONS = {
+    "M1438615574LE": (52224, 5064),
+}
+
+
 
 def is_lroc_nac_edr_product(metadata: Optional[Dict[str, Any]]) -> bool:
     """Detect LROC NAC EDR products from available metadata (not product ID alone)."""
@@ -51,6 +58,15 @@ def apply_lroc_nac_edr_pds3_profile(metadata: Optional[Dict[str, Any]]) -> Dict[
 
     lines = raw.get("lines") or dims.get("lines") or meta.get("lines")
     samples = raw.get("samples") or dims.get("samples") or meta.get("samples")
+
+    product_id = str(meta.get("product_id") or "").upper()
+    verified = _VERIFIED_LROC_NAC_EDR_DIMENSIONS.get(product_id)
+    if verified is not None:
+        # Prefer verified archive dimensions over placeholder catalog values
+        v_lines, v_samples = verified
+        if not lines or not samples or (int(lines), int(samples)) != (v_lines, v_samples):
+            lines, samples = v_lines, v_samples
+
     if not lines or not samples:
         return meta
 
