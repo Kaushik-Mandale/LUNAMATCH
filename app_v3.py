@@ -72,6 +72,13 @@ _src = _src.replace(
     1,
 )
 
+# Experimental / Cloud-safe: accept >=4 MAGSAC inliers (homography minimum)
+_src = _src.replace(
+    'if int(train_mask.sum()) < 8:\n            raise ValueError(f"Too few robust inliers ({int(train_mask.sum())}) after {geom_info.get(\'verifier_method\', geometric_verifier)} estimation.")',
+    'if int(train_mask.sum()) < (4 if execution_mode == "Experimental image-only mode" else 8):\n            raise ValueError(f"Too few robust inliers ({int(train_mask.sum())}) after {geom_info.get(\'verifier_method\', geometric_verifier)} estimation.")',
+    1,
+)
+
 _NEW_CROSS = '''
             # CROSS-SENSOR: SIFT when LoFTR disabled/unavailable (Cloud-safe)
             if (not loftr_avail) or os.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":
@@ -153,7 +160,7 @@ if "_cloud_safe_loftr_available" not in _src:
 if os.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":
     _src = _src.replace(
         'key="reference"\n    )',
-        'key="reference"\n    )\n    st.info("**Cloud-safe mode:** LoFTR disabled. OHRC-LROC uses SIFT multi-rep. max_side=768.")',
+        'key="reference"\n    )\n    st.info("**Cloud-safe mode:** LoFTR disabled. OHRC-LROC uses SIFT multi-rep. max_side=768. Experimental accepts >=4 MAGSAC inliers.")',
         1,
     )
 
