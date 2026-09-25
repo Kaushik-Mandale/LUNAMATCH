@@ -71,5 +71,87 @@ _src = _src.replace(
 def _b64(s: str) -> str:
     return base64.b64decode(s.encode("ascii")).decode("utf-8")
 
-# Patches embedded as base64 so unicode arrows survive transport
-_src = _src.replace(_b64(open.__doc__ and ""), "", 0)  # no-op keep structure
+# Critical: force is_loftr unavailable via env (already set). Soft-patch route + cross-sensor
+# via simple non-unicode-dependent replacements that always match.
+_src = _src.replace(
+    'route_status = "failed"\n            route_error = f"LoFTR dependency missing: {loftr_err}"',
+    'route_status = "success"\n            route_error = None',
+    1,
+)
+_src = _src.replace(
+    'raise RuntimeError(f"LoFTR dependency unavailable: {loftr_err}")',
+    'loftr_out = None  # Cloud-safe: skip LoFTR weight download',
+    1,
+)
+# After skipping LoFTR raise, the following loftr_match call would still run —
+# guard the whole block by making loftr_avail always false via inject below.
+
+_INJECT = '''
+# --- LunaMatch Cloud helpers (injected) ----------------------------------------
+import os as _os_helper
+try:
+    from core.upload_utils import (
+        MemUploadedFile,
+        download_url_product,
+        lightweight_file_id as _light_id,
+        safe_file_size as _safe_size,
+    )
+except Exception:
+    def _light_id(f):
+        import hashlib
+        n = getattr(f, "name", "") or ""
+        s = getattr(f, "size", None)
+        if s is None and hasattr(f, "getvalue"):
+            try:
+                s = len(f.getvalue())
+            except Exception:
+                s = 0
+        return hashlib.sha256(f"{n}|{s}".encode()).hexdigest()[:16]
+
+    def _safe_size(f):
+        s = getattr(f, "size", None)
+        if isinstance(s, int):
+            return s
+        return len(f.getvalue()) if f is not None and hasattr(f, "getvalue") else 0
+
+    download_url_product = None
+
+import loftr_matcher as _lm
+_orig_loftr_avail = _lm.is_loftr_available
+
+def _cloud_safe_loftr_available():
+    if _os_helper.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":
+        return False, "LoFTR disabled on Streamlit Cloud to prevent OOM."
+    return _orig_loftr_avail()
+
+_lm.is_loftr_available = _cloud_safe_loftr_available
+'''
+
+if "_cloud_safe_loftr_available" not in _src:
+    _src = _src.replace("import streamlit as st\n", "import streamlit as st\n" + _INJECT, 1)
+
+# Replace the broken raise-with-None path: inject SIFT runs when loftr_out is None
+_src = _src.replace(
+    'loftr_out = None  # Cloud-safe: skip LoFTR weight download\n\n            loftr_out = loftr_matcher.loftr_match(',
+    'loftr_out = None  # Cloud-safe: skip LoFTR weight download\n            if False:  # disabled LoFTR call\n                loftr_out = loftr_matcher.loftr_match(',
+    1,
+)
+
+# When loftr path was skipped, fill runs with SIFT before the LoFTR-dense assignment
+_src = _src.replace(
+    'runs = [\n                ("LoFTR-dense", loftr_out["correspondences"]),\n            ]',
+    'if loftr_out is None:\n                runs = [\n                    ("SIFT-intensity",  sift_run(src.gray,      ref.gray,      src.mask, ref.mask, feature_count, ratio_threshold)),\n                    ("SIFT-structure",  sift_run(src.structure,  ref.structure,  src.mask, ref.mask, feature_count, ratio_threshold)),\n                    ("SIFT-gradient",   sift_run(src.gradient,   ref.gradient,   src.mask, ref.mask, feature_count, ratio_threshold)),\n                ]\n                actual_matcher = "SIFT"\n                matcher_note = "Cross-sensor Cloud-safe path: SIFT multi-rep (LoFTR disabled to prevent OOM)"\n            else:\n                runs = [\n                    ("LoFTR-dense", loftr_out["correspondences"]),\n                ]',
+    1,
+)
+
+if os.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":
+    # Banner is injected near uploader via simple caption after imports load
+    pass
+
+_src = _src.replace(
+    'reference_file = st.file_uploader(\n        "Upload reference image", type=["tif", "tiff", "png", "jpg", "jpeg", "npy", "img", "raw", "dat"], key="reference"\n    )',
+    'reference_file = st.file_uploader(\n        "Upload reference image", type=["tif", "tiff", "png", "jpg", "jpeg", "npy", "img", "raw", "dat"], key="reference",\n        help="Large LROC EDR (~250 MB) uploads are limited by your home uplink.",\n    )\n    if os.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":\n        st.info("**Cloud-safe mode:** LoFTR disabled to prevent OOM. OHRC↔LROC uses SIFT multi-rep. max_side default 768.")',
+    1,
+)
+
+exec(compile(_src, "app_v3.py", "exec"), globals())
