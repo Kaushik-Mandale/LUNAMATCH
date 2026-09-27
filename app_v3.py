@@ -51,14 +51,13 @@ _src = _src.replace(
     1,
 )
 _src = _src.replace("ratio_threshold=0.78", "ratio_threshold=0.80")
-# Slightly looser MAGSAC default helps cross-sensor at working scale
+# Exact slider text from good commit
 _src = _src.replace(
-    'st.slider("RANSAC/MAGSAC threshold (working px)", 0.5, 8.0, 2.5, 0.1)',
-    'st.slider("RANSAC/MAGSAC threshold (working px)", 0.5, 12.0, 4.0, 0.1)',
+    'st.slider("RANSAC/MAGSAC threshold (working px)", 0.5, 6.0, 2.5, 0.25)',
+    'st.slider("RANSAC/MAGSAC threshold (working px)", 0.5, 12.0, 4.0, 0.25)',
     1,
 )
 _src = _src.replace("ransac_threshold=2.5", "ransac_threshold=4.0")
-_src = _src.replace("threshold=2.5", "threshold=4.0")
 
 _src = _src.replace(
     "len(source_file.getvalue()) / (1024 ** 2)",
@@ -99,7 +98,6 @@ _src = _src.replace(
     1,
 )
 
-# Fusion: LoFTR scores dominate; SIFT only fills coverage
 _OLD_FUSE = '''    is_loftr_run = any("LoFTR" in m for m, _ in runs)
     pool = {}
     for method, rows in runs:
@@ -127,9 +125,8 @@ _NEW_FUSE = '''    has_loftr = any("LoFTR" in m for m, _ in runs)
         for s, r, ratio in rows:
             key = (round(s[0], 1), round(s[1], 1), round(r[0], 1), round(r[1], 1))
             if "LoFTR" in method:
-                score = float(ratio) + 0.50  # strong preference for deep matches
+                score = float(ratio) + 0.50
             else:
-                # When LoFTR present, heavily down-weight SIFT to cut outlier pollution
                 score = max(0.0, 1.0 - float(ratio))
                 if has_loftr:
                     score *= 0.25
@@ -148,23 +145,33 @@ _src = _src.replace(
     1,
 )
 
-# Prefer LoFTR-only geometry when ROI matcher is dense enough
 _src = _src.replace(
     "ps, pr, scores, methods = fuse_and_select(runs, src.gray.shape, ref.gray.shape, grid_size, cell_limit)",
     "_runs_for_fuse = runs\n"
     "        _loftr_runs = [(n, r) for n, r in runs if 'LoFTR' in n and r]\n"
     "        if _loftr_runs and sum(len(r) for _, r in _loftr_runs) >= 12:\n"
-    "            _runs_for_fuse = _loftr_runs  # geometry from deep matches only\n"
+    "            _runs_for_fuse = _loftr_runs\n"
     "        ps, pr, scores, methods = fuse_and_select(_runs_for_fuse, src.gray.shape, ref.gray.shape, grid_size, cell_limit)",
     1,
 )
 
-# UI: treat SIFT+LoFTR-ROI as active deep matcher (not "LoFTR not available")
-_src = _src.replace(
-    'if actual_m == "LoFTR":\n                lm = ms.get("loftr_metrics", {})\n                st.success(\n                    f"✅ **Genuine LoFTR Active** ({lm.get(\'device\', \'cpu\').upper()}): "\n                    f"{lm.get(\'raw_matches\', 0)} raw matches → {lm.get(\'filtered_matches\', 0)} confident (threshold={lm.get(\'min_confidence\', 0.35):.2f})."\n                )',
-    'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):\n                lm = ms.get("loftr_metrics", {}) or {}\n                st.success(\n                    f"✅ **ROI-LoFTR Active** ({str(lm.get(\'device\', \'cpu\')).upper()}): "\n                    f"{lm.get(\'filtered_matches\', 0)} matches, rel_scale={lm.get(\'rel_scale\', \'—\')}, "\n                    f"mode={lm.get(\'mode\', actual_m)}."\n                )',
-    1,
+# UI fix via regex (handles quote variants)
+_src, _nu = re.subn(
+    r'if actual_m == "LoFTR":\n(\s*)lm = ms\.get\("loftr_metrics", \{\}\)\n(\s*)st\.success\(\n(\s*)f"✅ \*\*Genuine LoFTR Active\*\*.*?\n(\s*)f"\{lm\.get\(\'raw_matches\'.*?\n(\s*)\)',
+    'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):\n'
+    '\1lm = ms.get("loftr_metrics", {}) or {}\n'
+    '\2st.success(\n'
+    '\3f"✅ **ROI-LoFTR Active** ({str(lm.get(\'device\', \'cpu\')).upper()}): "\n'
+    '\3f"{lm.get(\'filtered_matches\', 0)} matches, rel_scale={lm.get(\'rel_scale\', \'—\')}, mode={lm.get(\'mode\', actual_m)}."\n'
+    '\5)',
+    _src,
+    count=1,
+    flags=re.S,
 )
+if _nu != 1:
+    # simpler fallback
+    _src = _src.replace('if actual_m == "LoFTR":', 'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):', 1)
+    _src = _src.replace('**Genuine LoFTR Active**', '**ROI-LoFTR Active**', 1)
 
 _NEW_CROSS = '''
             # CROSS-SENSOR: SIFT coarse + scale-aware ROI-LoFTR (LoFTR preferred for geometry)
@@ -215,7 +222,6 @@ _NEW_CROSS = '''
                     }
                     _n_loftr = int(loftr_out.get("filtered_matches") or 0)
                     if _n_loftr >= 12:
-                        # Dense deep matches: use LoFTR-ROI alone for geometry (cuts SIFT outliers)
                         runs = [("LoFTR-ROI", loftr_out["correspondences"])]
                         actual_matcher = "LoFTR-ROI"
                         matcher_note = (
@@ -224,7 +230,6 @@ _NEW_CROSS = '''
                             f"SIFT used only for ROI proposal"
                         )
                     elif _n_loftr >= 4:
-                        # Keep limited top SIFT for coverage fill; LoFTR still preferred in fusion scores
                         _cap = []
                         for _n, _r in _sift_runs:
                             _cap.append((_n, sorted(_r, key=lambda t: t[2])[:20]))
@@ -272,7 +277,7 @@ if "def _light_id" not in _src:
 
 _src = _src.replace(
     'key="reference"\n    )',
-    'key="reference"\n    )\n    st.info("**LoFTR-ROI primary:** when >=12 deep matches, geometry uses LoFTR only (SIFT = ROI proposal). MAGSAC default 4.0 px.")',
+    'key="reference"\n    )\n    st.info("**LoFTR-ROI primary:** >=12 deep matches → geometry uses LoFTR only. MAGSAC default 4.0 px. SIFT is ROI proposal / fallback.")',
     1,
 )
 
