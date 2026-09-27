@@ -51,7 +51,6 @@ _src = _src.replace(
     1,
 )
 _src = _src.replace("ratio_threshold=0.78", "ratio_threshold=0.80")
-# Exact slider text from good commit
 _src = _src.replace(
     'st.slider("RANSAC/MAGSAC threshold (working px)", 0.5, 6.0, 2.5, 0.25)',
     'st.slider("RANSAC/MAGSAC threshold (working px)", 0.5, 12.0, 4.0, 0.25)',
@@ -155,21 +154,26 @@ _src = _src.replace(
     1,
 )
 
-# UI fix via regex (handles quote variants)
-_src, _nu = re.subn(
-    r'if actual_m == "LoFTR":\n(\s*)lm = ms\.get\("loftr_metrics", \{\}\)\n(\s*)st\.success\(\n(\s*)f"✅ \*\*Genuine LoFTR Active\*\*.*?\n(\s*)f"\{lm\.get\(\'raw_matches\'.*?\n(\s*)\)',
-    'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):\n'
-    '\1lm = ms.get("loftr_metrics", {}) or {}\n'
-    '\2st.success(\n'
-    '\3f"✅ **ROI-LoFTR Active** ({str(lm.get(\'device\', \'cpu\')).upper()}): "\n'
-    '\3f"{lm.get(\'filtered_matches\', 0)} matches, rel_scale={lm.get(\'rel_scale\', \'—\')}, mode={lm.get(\'mode\', actual_m)}."\n'
-    '\5)',
-    _src,
-    count=1,
-    flags=re.S,
+# Clean UI patch (no regex backrefs — those caused SyntaxError with control chars)
+_OLD_UI = (
+    'if actual_m == "LoFTR":\n'
+    '                lm = ms.get("loftr_metrics", {})\n'
+    '                st.success(\n'
+    '                    f"✅ **Genuine LoFTR Active** ({lm.get(\'device\', \'cpu\').upper()}): "\n'
+    '                    f"{lm.get(\'raw_matches\', 0)} raw matches → {lm.get(\'filtered_matches\', 0)} confident (threshold={lm.get(\'min_confidence\', 0.35):.2f})."\n'
+    '                )'
 )
-if _nu != 1:
-    # simpler fallback
+_NEW_UI = (
+    'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):\n'
+    '                lm = ms.get("loftr_metrics", {}) or {}\n'
+    '                st.success(\n'
+    '                    f"✅ **ROI-LoFTR Active** ({str(lm.get(\'device\', \'cpu\')).upper()}): "\n'
+    '                    f"{lm.get(\'filtered_matches\', 0)} matches, rel_scale={lm.get(\'rel_scale\', \'—\')}, mode={lm.get(\'mode\', actual_m)}."\n'
+    '                )'
+)
+if _OLD_UI in _src:
+    _src = _src.replace(_OLD_UI, _NEW_UI, 1)
+else:
     _src = _src.replace('if actual_m == "LoFTR":', 'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):', 1)
     _src = _src.replace('**Genuine LoFTR Active**', '**ROI-LoFTR Active**', 1)
 
@@ -280,5 +284,13 @@ _src = _src.replace(
     'key="reference"\n    )\n    st.info("**LoFTR-ROI primary:** >=12 deep matches → geometry uses LoFTR only. MAGSAC default 4.0 px. SIFT is ROI proposal / fallback.")',
     1,
 )
+
+# Validate before exec — fail fast with a clear message if soft-patches break syntax
+try:
+    compile(_src, "app_v3.py", "exec")
+except SyntaxError as _syn:
+    raise RuntimeError(
+        f"Bootstrap produced invalid Python at line {_syn.lineno}: {_syn.msg}"
+    ) from _syn
 
 exec(compile(_src, "app_v3.py", "exec"), globals())
