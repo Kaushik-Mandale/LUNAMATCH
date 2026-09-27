@@ -1,4 +1,4 @@
-"""LunaMatch V3 bootstrap — multi-pass geometry + stricter LoFTR confidence."""
+"""LunaMatch V3 bootstrap — multi-pass geometry + server-side URL reference load."""
 from __future__ import annotations
 
 import os
@@ -150,7 +150,6 @@ _src = _src.replace(
     1,
 )
 
-# Multi-pass MAGSAC
 _OLD_GEOM = (
     "        H, train_mask, geom_info = estimate_geometric_model(\n"
     "            ps[train_idx], pr[train_idx], model=model, verifier=geometric_verifier, threshold=ransac_threshold\n"
@@ -341,9 +340,30 @@ except Exception:
 if "def _light_id" not in _src:
     _src = _src.replace("import streamlit as st\n", "import streamlit as st\n" + _INJECT, 1)
 
+# Server-side URL loader for large LROC reference (avoids stalled browser uploads)
 _src = _src.replace(
     'key="reference"\n    )',
-    'key="reference"\n    )\n    st.info("**RMSE push:** strict LoFTR conf for geometry, multi-pass MAGSAC (coarse→fine), sub-pixel re-estimate on inliers only.")',
+    'key="reference"\n    )\n'
+    '    st.caption("252 MB LROC uploads can stall on slow home uplinks. Prefer **server-side URL** below when possible.")\n'
+    '    _ref_url = st.text_input(\n'
+    '        "Or load reference via direct HTTPS URL (server downloads it)",\n'
+    '        value="",\n'
+    '        key="reference_url_fetch",\n'
+    '        placeholder="https://…/M1438615574LE.IMG",\n'
+    '        help="Paste a direct link to the .IMG. Streamlit Cloud fetches it server-side.",\n'
+    '    )\n'
+    '    if _ref_url and _ref_url.strip().startswith(("http://", "https://")) and reference_file is None:\n'
+    '        try:\n'
+    '            from core.upload_utils import download_url_product as _dl_ref\n'
+    '            with st.spinner("Downloading reference on server (may take a few minutes)…"):\n'
+    '                reference_file = _dl_ref(_ref_url.strip())\n'
+    '            st.success(\n'
+    '                f"Loaded **{reference_file.name}** "\n'
+    '                f"({getattr(reference_file, \'size\', 0) / (1024 ** 2):.1f} MB) from URL"\n'
+    '            )\n'
+    '        except Exception as _url_exc:\n'
+    '            st.error(f"URL fetch failed: {_url_exc}")\n'
+    '    st.info("**RMSE push:** strict LoFTR conf, multi-pass MAGSAC, inlier-only sub-pixel re-estimate.")',
     1,
 )
 
