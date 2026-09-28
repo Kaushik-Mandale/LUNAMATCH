@@ -1,4 +1,4 @@
-"""LunaMatch V3 bootstrap — Streamlit Cloud (lean, soft-fail)."""
+"""LunaMatch V3 bootstrap — multi-pass geometry + server-side URL reference load."""
 from __future__ import annotations
 
 import os
@@ -14,22 +14,20 @@ for _k, _v in (
 ):
     os.environ.setdefault(_k, _v)
 
+_on_cloud = bool(
+    os.environ.get("STREAMLIT_SHARING_MODE")
+    or os.environ.get("STREAMLIT_SERVER_HEADLESS")
+    or os.path.exists("/mount/src")
+    or "streamlit.app" in os.environ.get("HOSTNAME", "")
+)
 os.environ.setdefault("LUNAMATCH_ROI_LOFTR", "1")
 
 _URL = (
     "https://raw.githubusercontent.com/Kaushik-Mandale/LUNAMATCH/"
     "a12f6c3394b5510357d1c5aad1fe3d9ffd7244f1/app_v3.py"
 )
-try:
-    with urllib.request.urlopen(_URL, timeout=45) as _resp:
-        _src = _resp.read().decode("utf-8")
-except Exception as _fetch_exc:
-    import streamlit as st
-    st.set_page_config(page_title="LunaMatch", layout="wide")
-    st.error("Could not download core app source from GitHub.")
-    st.exception(_fetch_exc)
-    st.info("Then **Manage app → Reboot**.")
-    st.stop()
+with urllib.request.urlopen(_URL, timeout=60) as _resp:
+    _src = _resp.read().decode("utf-8")
 
 _src = _src.replace("max_side=2048, feature_count=12000,", "max_side=768, feature_count=4000,", 1)
 _src = _src.replace("[1024, 1600, 2048, 3072, 4096], value=2048", "[512, 768, 1024, 1536], value=768", 1)
@@ -41,10 +39,10 @@ _src = _src.replace(
 _src = _src.replace("feature_count = 12000\n", "feature_count = 4000\n", 1)
 _src = _src.replace(
     'st.slider("LoFTR confidence threshold", 0.10, 0.90, 0.35, 0.05)',
-    'st.slider("LoFTR confidence threshold", 0.10, 0.90, 0.28, 0.05)',
+    'st.slider("LoFTR confidence threshold", 0.10, 0.90, 0.32, 0.05)',
     1,
 )
-_src = _src.replace("loftr_confidence_threshold = 0.35\n", "loftr_confidence_threshold = 0.28\n", 1)
+_src = _src.replace("loftr_confidence_threshold = 0.35\n", "loftr_confidence_threshold = 0.32\n", 1)
 _src = _src.replace(
     'st.slider("Reciprocal descriptor ratio", 0.55, 0.90, 0.78, 0.01)',
     'st.slider("Reciprocal descriptor ratio", 0.55, 0.90, 0.80, 0.01)',
@@ -186,6 +184,8 @@ _NEW_GEOM = (
     "                    if isinstance(info2, dict):\n"
     "                        geom_info = dict(info2)\n"
     "                    geom_info['multi_pass'] = True\n"
+    "                    geom_info['coarse_threshold'] = float(ransac_threshold)\n"
+    "                    geom_info['fine_threshold'] = float(_th_fine)\n"
     "                    geom_info['inlier_count'] = int(train_mask.sum())\n"
     "            except Exception:\n"
     "                pass\n"
@@ -195,7 +195,7 @@ _NEW_GEOM = (
 if _OLD_GEOM in _src:
     _src = _src.replace(_OLD_GEOM, _NEW_GEOM, 1)
 else:
-    print("[bootstrap] geometry multi-pass patch skipped")
+    raise RuntimeError("geometry block not found for multi-pass patch")
 
 _src = _src.replace(
     "H2, mask2, _ = estimate_geometric_model(rs, rr, model=model, verifier=geometric_verifier, threshold=ransac_threshold)",
@@ -208,11 +208,30 @@ _src = _src.replace(
     1,
 )
 
-_src = _src.replace('if actual_m == "LoFTR":', 'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):', 1)
-_src = _src.replace('**Genuine LoFTR Active**', '**ROI-LoFTR Active**', 1)
+_OLD_UI = (
+    'if actual_m == "LoFTR":\n'
+    '                lm = ms.get("loftr_metrics", {})\n'
+    '                st.success(\n'
+    '                    f"✅ **Genuine LoFTR Active** ({lm.get(\'device\', \'cpu\').upper()}): "\n'
+    '                    f"{lm.get(\'raw_matches\', 0)} raw matches → {lm.get(\'filtered_matches\', 0)} confident (threshold={lm.get(\'min_confidence\', 0.35):.2f})."\n'
+    '                )'
+)
+_NEW_UI = (
+    'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):\n'
+    '                lm = ms.get("loftr_metrics", {}) or {}\n'
+    '                st.success(\n'
+    '                    f"✅ **ROI-LoFTR Active** ({str(lm.get(\'device\', \'cpu\')).upper()}): "\n'
+    '                    f"{lm.get(\'filtered_matches\', 0)} matches, rel_scale={lm.get(\'rel_scale\', \'—\')}, mode={lm.get(\'mode\', actual_m)}."\n'
+    '                )'
+)
+if _OLD_UI in _src:
+    _src = _src.replace(_OLD_UI, _NEW_UI, 1)
+else:
+    _src = _src.replace('if actual_m == "LoFTR":', 'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):', 1)
+    _src = _src.replace('**Genuine LoFTR Active**', '**ROI-LoFTR Active**', 1)
 
 _NEW_CROSS = '''
-            # CROSS-SENSOR: SIFT coarse + scale-aware ROI-LoFTR
+            # CROSS-SENSOR: SIFT coarse + scale-aware ROI-LoFTR (strict conf for geometry)
             _sift_runs = [
                 ("SIFT-intensity",  sift_run(src.gray,      ref.gray,      src.mask, ref.mask, feature_count, ratio_threshold)),
                 ("SIFT-structure",  sift_run(src.structure,  ref.structure,  src.mask, ref.mask, feature_count, ratio_threshold)),
@@ -233,7 +252,7 @@ _NEW_CROSS = '''
             if _try_roi and loftr_avail:
                 try:
                     import roi_loftr as _roi
-                    _conf_discover = min(float(loftr_confidence_threshold), 0.26)
+                    _conf_discover = min(float(loftr_confidence_threshold), 0.28)
                     loftr_out = _roi.loftr_match_roi_gated(
                         source_gray=src.gray,
                         reference_gray=ref.gray,
@@ -247,37 +266,55 @@ _NEW_CROSS = '''
                         ratio_threshold=max(float(ratio_threshold), 0.80),
                     )
                     _all_corrs = list(loftr_out.get("correspondences") or [])
-                    _geom_conf = max(0.26, float(loftr_confidence_threshold))
+                    _geom_conf = max(0.30, float(loftr_confidence_threshold))
                     _strict = [c for c in _all_corrs if float(c[2]) >= _geom_conf]
                     _strict = sorted(_strict, key=lambda t: -float(t[2]))
                     if len(_strict) < 10:
                         _strict = sorted(_all_corrs, key=lambda t: -float(t[2]))
-                        _strict = [c for c in _strict if float(c[2]) >= min(_geom_conf, 0.20)][:50]
+                        _strict = [c for c in _strict if float(c[2]) >= min(_geom_conf, 0.22)][:40]
                     loftr_metrics = {
                         "raw_matches": loftr_out.get("raw_matches"),
                         "filtered_matches": len(_strict),
                         "min_confidence": _geom_conf,
                         "device": loftr_out.get("device"),
+                        "roi_source_box": loftr_out.get("roi_source_box"),
+                        "roi_reference_box": loftr_out.get("roi_reference_box"),
+                        "coarse_match_count": loftr_out.get("coarse_match_count"),
                         "rel_scale": loftr_out.get("rel_scale"),
                         "mode": loftr_out.get("mode"),
+                        "second_pass": loftr_out.get("second_pass"),
                         "discovered": len(_all_corrs),
                     }
                     _n_loftr = len(_strict)
                     if _n_loftr >= 10:
                         runs = [("LoFTR-ROI", _strict)]
                         actual_matcher = "LoFTR-ROI"
-                        matcher_note = f"LoFTR-ROI primary: {_n_loftr}/{len(_all_corrs)} strict"
+                        matcher_note = (
+                            f"LoFTR-ROI primary ({str(loftr_out.get('device', 'cpu')).upper()}): "
+                            f"{_n_loftr}/{len(_all_corrs)} strict (conf>={_geom_conf:.2f}), "
+                            f"rel_scale={loftr_out.get('rel_scale')}"
+                        )
                     elif _n_loftr >= 4:
-                        _cap = [(_n, sorted(_r, key=lambda t: t[2])[:15]) for _n, _r in _sift_runs]
+                        _cap = []
+                        for _n, _r in _sift_runs:
+                            _cap.append((_n, sorted(_r, key=lambda t: t[2])[:15]))
                         runs = _cap + [("LoFTR-ROI", _strict)]
                         actual_matcher = "SIFT+LoFTR-ROI"
-                        matcher_note = f"ROI-LoFTR {_n_loftr} + SIFT"
+                        matcher_note = (
+                            f"Scale-aware ROI-LoFTR ({str(loftr_out.get('device', 'cpu')).upper()}): "
+                            f"{_n_loftr} strict deep + capped SIFT, rel_scale={loftr_out.get('rel_scale')}"
+                        )
                     else:
-                        matcher_note = f"SIFT; ROI-LoFTR sparse ({_n_loftr})"
+                        matcher_note = (
+                            f"SIFT multi-rep; ROI-LoFTR only {_n_loftr} strict matches "
+                            f"(rel_scale={loftr_out.get('rel_scale')}; kept SIFT)"
+                        )
                 except Exception as _roi_exc:
-                    matcher_note = f"SIFT (ROI-LoFTR skipped: {_roi_exc})"
+                    matcher_note = f"SIFT multi-rep (ROI-LoFTR skipped: {_roi_exc})"
+            elif os.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":
+                matcher_note = "Cross-sensor: SIFT multi-rep (LoFTR disabled via env)"
             elif not loftr_avail:
-                matcher_note = f"SIFT (LoFTR unavailable: {loftr_err})"
+                matcher_note = f"Cross-sensor: SIFT multi-rep (LoFTR unavailable: {loftr_err})"
 '''
 
 _src, _n = re.subn(
@@ -288,7 +325,7 @@ _src, _n = re.subn(
     count=1,
 )
 if _n != 1:
-    print(f"[bootstrap] cross-sensor patch skipped (matches={_n})")
+    raise RuntimeError(f"Cloud bootstrap failed to patch cross-sensor block (matches={_n})")
 
 _INJECT = '''
 try:
@@ -306,34 +343,34 @@ if "def _light_id" not in _src:
 _src = _src.replace(
     'key="reference"\n    )',
     'key="reference"\n    )\n'
-    '    st.caption("Large LROC: use server-side URL if browser upload stalls.")\n'
-    '    _ref_url = st.text_input("Or load reference via direct HTTPS URL", value="", key="reference_url_fetch", placeholder="https://…/M….IMG")\n'
+    '    st.caption("252 MB LROC uploads can stall on slow home uplinks. Prefer **server-side URL** below when possible.")\n'
+    '    _ref_url = st.text_input(\n'
+    '        "Or load reference via direct HTTPS URL (server downloads it)",\n'
+    '        value="",\n'
+    '        key="reference_url_fetch",\n'
+    '        placeholder="https://…/M1438615574LE.IMG",\n'
+    '        help="Paste a direct link to the .IMG. Streamlit Cloud fetches it server-side.",\n'
+    '    )\n'
     '    if _ref_url and _ref_url.strip().startswith(("http://", "https://")) and reference_file is None:\n'
     '        try:\n'
     '            from core.upload_utils import download_url_product as _dl_ref\n'
-    '            with st.spinner("Server downloading reference…"):\n'
+    '            with st.spinner("Downloading reference on server (may take a few minutes)…"):\n'
     '                reference_file = _dl_ref(_ref_url.strip())\n'
-    '            st.success(f"Loaded **{reference_file.name}** ({getattr(reference_file, \"size\", 0)/(1024**2):.1f} MB)")\n'
-    '        except Exception as _ue:\n'
-    '            st.error(f"URL fetch failed: {_ue}")\n'
-    '    st.info("**LunaMatch:** ROI-LoFTR + multi-pass MAGSAC (Streamlit Cloud).")',
+    '            st.success(\n'
+    '                f"Loaded **{reference_file.name}** "\n'
+    '                f"({getattr(reference_file, \'size\', 0) / (1024 ** 2):.1f} MB) from URL"\n'
+    '            )\n'
+    '        except Exception as _url_exc:\n'
+    '            st.error(f"URL fetch failed: {_url_exc}")\n'
+    '    st.info("**RMSE push:** strict LoFTR conf for geometry, multi-pass MAGSAC (coarse→fine), sub-pixel re-estimate on inliers only.")',
     1,
 )
 
 try:
     compile(_src, "app_v3.py", "exec")
 except SyntaxError as _syn:
-    import streamlit as st
-    st.set_page_config(page_title="LunaMatch", layout="wide")
-    st.error(f"Bootstrap syntax error at line {_syn.lineno}: {_syn.msg}")
-    st.stop()
+    raise RuntimeError(
+        f"Bootstrap produced invalid Python at line {_syn.lineno}: {_syn.msg}"
+    ) from _syn
 
-try:
-    exec(compile(_src, "app_v3.py", "exec"), globals())
-except Exception as _boot_exc:
-    import streamlit as st
-    st.set_page_config(page_title="LunaMatch", layout="wide")
-    st.error("LunaMatch failed to start")
-    st.exception(_boot_exc)
-    st.info("Try **Manage app → Reboot**.")
-    st.stop()
+exec(compile(_src, "app_v3.py", "exec"), globals())
