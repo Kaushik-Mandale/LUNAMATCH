@@ -1,4 +1,4 @@
-"""LunaMatch V3 bootstrap — multi-pass geometry + HF Space memory profile."""
+"""LunaMatch V3 bootstrap — soft-fail + visible startup errors."""
 from __future__ import annotations
 
 import os
@@ -10,7 +10,6 @@ _on_hf = bool(
     or os.environ.get("SPACE_REPO_NAME")
     or os.environ.get("LUNAMATCH_HF_SPACE") == "1"
 )
-# On HF CPU Basic (~16 GB) allow more working resolution; Streamlit Cloud stays lean
 _threads = "2" if _on_hf else "1"
 for _k, _v in (
     ("OMP_NUM_THREADS", _threads),
@@ -29,11 +28,18 @@ _URL = (
     "https://raw.githubusercontent.com/Kaushik-Mandale/LUNAMATCH/"
     "a12f6c3394b5510357d1c5aad1fe3d9ffd7244f1/app_v3.py"
 )
-with urllib.request.urlopen(_URL, timeout=60) as _resp:
-    _src = _resp.read().decode("utf-8")
+try:
+    with urllib.request.urlopen(_URL, timeout=45) as _resp:
+        _src = _resp.read().decode("utf-8")
+except Exception as _fetch_exc:
+    import streamlit as st
+    st.set_page_config(page_title="LunaMatch", layout="wide")
+    st.error("Could not download core app source from GitHub.")
+    st.exception(_fetch_exc)
+    st.info("Check network / raw.githubusercontent.com access, then **Manage app → Reboot**.")
+    st.stop()
 
 if _on_hf:
-    # More headroom on HF: larger working image + denser features + larger LoFTR ROI
     _src = _src.replace("max_side=2048, feature_count=12000,", "max_side=1280, feature_count=6000,", 1)
     _src = _src.replace("[1024, 1600, 2048, 3072, 4096], value=2048", "[768, 1024, 1280, 1536], value=1280", 1)
     _src = _src.replace(
@@ -210,7 +216,7 @@ _NEW_GEOM = (
 if _OLD_GEOM in _src:
     _src = _src.replace(_OLD_GEOM, _NEW_GEOM, 1)
 else:
-    raise RuntimeError("geometry block not found for multi-pass patch")
+    print("[bootstrap] geometry multi-pass patch skipped")
 
 _src = _src.replace(
     "H2, mask2, _ = estimate_geometric_model(rs, rr, model=model, verifier=geometric_verifier, threshold=ransac_threshold)",
@@ -226,7 +232,6 @@ _src = _src.replace(
 _src = _src.replace('if actual_m == "LoFTR":', 'if actual_m == "LoFTR" or (actual_m and "LoFTR" in str(actual_m)):', 1)
 _src = _src.replace('**Genuine LoFTR Active**', '**ROI-LoFTR Active**', 1)
 
-# Larger ROI on HF
 _roi_side = "min(int(max_side), 768)" if _on_hf else "min(int(max_side), 512)"
 _pad = "0.40" if _on_hf else "0.30"
 
@@ -277,45 +282,26 @@ _NEW_CROSS = f'''
                         "filtered_matches": len(_strict),
                         "min_confidence": _geom_conf,
                         "device": loftr_out.get("device"),
-                        "roi_source_box": loftr_out.get("roi_source_box"),
-                        "roi_reference_box": loftr_out.get("roi_reference_box"),
-                        "coarse_match_count": loftr_out.get("coarse_match_count"),
                         "rel_scale": loftr_out.get("rel_scale"),
                         "mode": loftr_out.get("mode"),
-                        "second_pass": loftr_out.get("second_pass"),
                         "discovered": len(_all_corrs),
-                        "host": "hf" if os.environ.get("LUNAMATCH_HF_SPACE") == "1" else "cloud",
                     }}
                     _n_loftr = len(_strict)
                     if _n_loftr >= 10:
                         runs = [("LoFTR-ROI", _strict)]
                         actual_matcher = "LoFTR-ROI"
-                        matcher_note = (
-                            f"LoFTR-ROI primary ({{str(loftr_out.get('device', 'cpu')).upper()}}): "
-                            f"{{_n_loftr}}/{{len(_all_corrs)}} strict (conf>={{_geom_conf:.2f}}), "
-                            f"rel_scale={{loftr_out.get('rel_scale')}}"
-                        )
+                        matcher_note = f"LoFTR-ROI primary: {{_n_loftr}}/{{len(_all_corrs)}} strict"
                     elif _n_loftr >= 4:
-                        _cap = []
-                        for _n, _r in _sift_runs:
-                            _cap.append((_n, sorted(_r, key=lambda t: t[2])[:15]))
+                        _cap = [(_n, sorted(_r, key=lambda t: t[2])[:15]) for _n, _r in _sift_runs]
                         runs = _cap + [("LoFTR-ROI", _strict)]
                         actual_matcher = "SIFT+LoFTR-ROI"
-                        matcher_note = (
-                            f"Scale-aware ROI-LoFTR ({{str(loftr_out.get('device', 'cpu')).upper()}}): "
-                            f"{{_n_loftr}} strict deep + capped SIFT, rel_scale={{loftr_out.get('rel_scale')}}"
-                        )
+                        matcher_note = f"ROI-LoFTR {{_n_loftr}} + SIFT"
                     else:
-                        matcher_note = (
-                            f"SIFT multi-rep; ROI-LoFTR only {{_n_loftr}} strict matches "
-                            f"(rel_scale={{loftr_out.get('rel_scale')}}; kept SIFT)"
-                        )
+                        matcher_note = f"SIFT; ROI-LoFTR sparse ({{_n_loftr}})"
                 except Exception as _roi_exc:
-                    matcher_note = f"SIFT multi-rep (ROI-LoFTR skipped: {{_roi_exc}})"
-            elif os.environ.get("LUNAMATCH_DISABLE_LOFTR") == "1":
-                matcher_note = "Cross-sensor: SIFT multi-rep (LoFTR disabled via env)"
+                    matcher_note = f"SIFT (ROI-LoFTR skipped: {{_roi_exc}})"
             elif not loftr_avail:
-                matcher_note = f"Cross-sensor: SIFT multi-rep (LoFTR unavailable: {{loftr_err}})"
+                matcher_note = f"SIFT (LoFTR unavailable: {{loftr_err}})"
 '''
 
 _src, _n = re.subn(
@@ -326,7 +312,7 @@ _src, _n = re.subn(
     count=1,
 )
 if _n != 1:
-    raise RuntimeError(f"Cloud bootstrap failed to patch cross-sensor block (matches={{_n}})")
+    print(f"[bootstrap] cross-sensor patch skipped (matches={_n})")
 
 _INJECT = '''
 try:
@@ -354,15 +340,24 @@ _src = _src.replace(
     '            st.success(f"Loaded **{reference_file.name}** ({getattr(reference_file, \"size\", 0)/(1024**2):.1f} MB)")\n'
     '        except Exception as _ue:\n'
     '            st.error(f"URL fetch failed: {_ue}")\n'
-    '    st.info("**Deploy tip:** Hugging Face Spaces CPU Basic (~16 GB) allows larger ROI than Streamlit Cloud.")',
+    '    st.info("**LunaMatch:** ROI-LoFTR + multi-pass MAGSAC on Streamlit Cloud.")',
     1,
 )
 
 try:
     compile(_src, "app_v3.py", "exec")
 except SyntaxError as _syn:
-    raise RuntimeError(
-        f"Bootstrap produced invalid Python at line {_syn.lineno}: {_syn.msg}"
-    ) from _syn
+    import streamlit as st
+    st.set_page_config(page_title="LunaMatch", layout="wide")
+    st.error(f"Bootstrap syntax error at line {_syn.lineno}: {_syn.msg}")
+    st.stop()
 
-exec(compile(_src, "app_v3.py", "exec"), globals())
+try:
+    exec(compile(_src, "app_v3.py", "exec"), globals())
+except Exception as _boot_exc:
+    import streamlit as st
+    st.set_page_config(page_title="LunaMatch", layout="wide")
+    st.error("LunaMatch failed to start")
+    st.exception(_boot_exc)
+    st.info("Try **Manage app → Reboot**. If it persists, check logs.")
+    st.stop()
