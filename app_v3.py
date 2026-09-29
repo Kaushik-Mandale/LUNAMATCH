@@ -1,4 +1,4 @@
-"""LunaMatch V3 bootstrap — GSD-aware scale + CLAHE LoFTR + guided rematch."""
+"""LunaMatch V3 bootstrap — browse-safe scale + CLAHE LoFTR + guided rematch."""
 from __future__ import annotations
 
 import os
@@ -112,7 +112,7 @@ _src = _src.replace(
 )
 _src = _src.replace(
     'if int(train_mask.sum()) < 8:\n            raise ValueError(f"Too few robust inliers ({int(train_mask.sum())}) after {geom_info.get(\'verifier_method\', geometric_verifier)} estimation.")',
-    'if int(train_mask.sum()) < (4 if execution_mode == "Experimental image-only mode" else 8):\n            raise ValueError(f"Too few robust inliers ({int(train_mask.sum())}) after {geom_info.get(\'verifier_method\', geometric_verifier)} estimation.")',
+    'if int(train_mask.sum()) < (3 if execution_mode == "Experimental image-only mode" else 8):\n            raise ValueError(f"Too few robust inliers ({int(train_mask.sum())}) after {geom_info.get(\'verifier_method\', geometric_verifier)} estimation.")',
     1,
 )
 
@@ -155,7 +155,7 @@ if _OLD_FUSE in _src:
 
 _src = _src.replace(
     'if len(selected) < 8:\n        raise ValueError(f"Only {len(selected)} fused correspondences survived. Need at least 8.")',
-    'if len(selected) < 4:\n        raise ValueError(f"Only {len(selected)} fused correspondences survived. Need at least 4.")',
+    'if len(selected) < 3:\n        raise ValueError(f"Only {len(selected)} fused correspondences survived. Need at least 3.")',
     1,
 )
 
@@ -219,7 +219,7 @@ _src = _src.replace(
 )
 _src = _src.replace(
     "if mask2.sum() >= 8:",
-    "if int(np.asarray(mask2).reshape(-1).sum()) >= (4 if execution_mode == \"Experimental image-only mode\" else 8):",
+    "if int(np.asarray(mask2).reshape(-1).sum()) >= (3 if execution_mode == \"Experimental image-only mode\" else 8):",
     1,
 )
 
@@ -263,7 +263,7 @@ if _on_cloud:
 '''
 else:
     _NEW_CROSS = '''
-            # CROSS-SENSOR: GSD-scale + CLAHE LoFTR + guided rematch (local GPU)
+            # CROSS-SENSOR: browse-safe scale + CLAHE LoFTR + guided rematch
             runs = []
             actual_matcher = "SIFT"
             matcher_note = "Cross-sensor"
@@ -301,10 +301,19 @@ else:
                         _ref_gsd = _pick_gsd(reference_metadata)
                     except Exception:
                         _ref_gsd = None
-                    if _src_gsd is None and str(source_sensor).upper().startswith("OHRC"):
-                        _src_gsd = 0.24
-                    if _ref_gsd is None and "LROC" in str(reference_sensor).upper():
-                        _ref_gsd = 2.0
+                    _src_name = ""
+                    try:
+                        _src_name = str(getattr(source_file, "name", "") or "").lower()
+                    except Exception:
+                        pass
+                    _is_browse = any(t in _src_name for t in ("brw", "browse", "_thumb", "preview"))
+                    if _is_browse:
+                        _src_gsd, _ref_gsd = None, None
+                    else:
+                        if _src_gsd is None and str(source_sensor).upper().startswith("OHRC"):
+                            _src_gsd = 0.24
+                        if _ref_gsd is None and "LROC" in str(reference_sensor).upper():
+                            _ref_gsd = 2.0
                     loftr_out = _cs.match_cross_sensor_full(
                         source_gray=src.gray, reference_gray=ref.gray,
                         source_mask=src.mask, reference_mask=ref.mask,
@@ -325,8 +334,9 @@ else:
                         "scale_apply": loftr_out.get("scale_apply"),
                         "scale_source": loftr_out.get("scale_source"),
                         "max_side": _full_side,
+                        "browse_source": _is_browse,
                     }
-                    if len(_corrs) < 4:
+                    if len(_corrs) < 3:
                         raise ValueError(f"only {len(_corrs)} after scale-CLAHE LoFTR")
                     try:
                         import guided_match as _gm
@@ -346,7 +356,7 @@ else:
                     runs = [("LoFTR-full", _corrs)]
                     actual_matcher = "LoFTR-full"
                     matcher_note = (
-                        f"GSD-scale LoFTR ({str(loftr_out.get('device','cpu')).upper()}): "
+                        f"Scale LoFTR ({str(loftr_out.get('device','cpu')).upper()}): "
                         f"{loftr_out.get('raw_matches')}→{len(_corrs)}, scale={loftr_out.get('scale_apply')} ({loftr_out.get('scale_source')})"
                         f"{_gnote}"
                     )
@@ -410,7 +420,7 @@ if "def _light_id" not in _src:
 _src = _src.replace(
     'key="reference"\n    )',
     'key="reference"\n    )\n'
-    '    st.info("**Local:** GSD-aware scale + CLAHE LoFTR + guided rematch. Affine / MAGSAC=7 / conf=0.26 defaults.")\n',
+    '    st.info("**Local:** Browse-safe scale + CLAHE LoFTR + guided rematch. Affine / MAGSAC=7 / conf=0.26.")\n',
     1,
 )
 
