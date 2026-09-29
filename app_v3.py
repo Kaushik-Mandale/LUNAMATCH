@@ -1,4 +1,4 @@
-"""LunaMatch V3 bootstrap — scale-aware CLAHE full LoFTR (local GPU)."""
+"""LunaMatch V3 bootstrap — scale-aware CLAHE LoFTR; Affine/MAGSAC7/conf0.26 defaults."""
 from __future__ import annotations
 
 import os
@@ -53,12 +53,13 @@ else:
     )
     _src = _src.replace("feature_count = 12000\n", "feature_count = 8000\n", 1)
 
+# Defaults tuned for cross-sensor OHRC↔LROC
 _src = _src.replace(
     'st.slider("LoFTR confidence threshold", 0.10, 0.90, 0.35, 0.05)',
-    'st.slider("LoFTR confidence threshold", 0.10, 0.90, 0.30, 0.05)',
+    'st.slider("LoFTR confidence threshold", 0.10, 0.90, 0.26, 0.05)',
     1,
 )
-_src = _src.replace("loftr_confidence_threshold = 0.35\n", "loftr_confidence_threshold = 0.30\n", 1)
+_src = _src.replace("loftr_confidence_threshold = 0.35\n", "loftr_confidence_threshold = 0.26\n", 1)
 _src = _src.replace(
     'st.slider("Reciprocal descriptor ratio", 0.55, 0.90, 0.78, 0.01)',
     'st.slider("Reciprocal descriptor ratio", 0.55, 0.90, 0.82, 0.01)',
@@ -67,10 +68,15 @@ _src = _src.replace(
 _src = _src.replace("ratio_threshold=0.78", "ratio_threshold=0.82")
 _src = _src.replace(
     'st.slider("RANSAC/MAGSAC threshold (working px)", 0.5, 6.0, 2.5, 0.25)',
-    'st.slider("RANSAC/MAGSAC threshold (working px)", 0.5, 12.0, 5.0, 0.25)',
+    'st.slider("RANSAC/MAGSAC threshold (working px)", 0.5, 12.0, 7.0, 0.25)',
     1,
 )
-_src = _src.replace("ransac_threshold=2.5", "ransac_threshold=5.0")
+_src = _src.replace("ransac_threshold=2.5", "ransac_threshold=7.0")
+_src = _src.replace(
+    'st.selectbox("Global geometric model", ["Homography", "Affine"])',
+    'st.selectbox("Global geometric model", ["Affine", "Homography"])',
+    1,
+)
 
 _src = _src.replace(
     "len(source_file.getvalue()) / (1024 ** 2)",
@@ -279,7 +285,7 @@ else:
                         source_mask=src.mask, reference_mask=ref.mask,
                         min_confidence=min(0.20, float(loftr_confidence_threshold)),
                         max_side=_full_side,
-                        geom_conf_floor=max(0.30, float(loftr_confidence_threshold)),
+                        geom_conf_floor=max(0.26, float(loftr_confidence_threshold)),
                     )
                     _corrs = list(loftr_out.get("correspondences") or [])
                     loftr_metrics = {
@@ -359,7 +365,7 @@ if "def _light_id" not in _src:
 _src = _src.replace(
     'key="reference"\n    )',
     'key="reference"\n    )\n'
-    '    st.info("**Local:** Scale-aware CLAHE + full LoFTR (fixes dark OHRC / GSD gap). Uncheck RANSAC comparison. Try Affine if RMSE is huge.")\n',
+    '    st.info("**Local defaults:** Affine + MAGSAC thr=7 + LoFTR conf=0.26 + scale/CLAHE LoFTR. Leave RANSAC comparison OFF.")\n',
     1,
 )
 
