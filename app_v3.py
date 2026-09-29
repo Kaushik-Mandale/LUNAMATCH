@@ -1,4 +1,4 @@
-"""LunaMatch V3 bootstrap — scale-aware CLAHE LoFTR; Affine/MAGSAC7/conf0.26 defaults."""
+"""LunaMatch V3 bootstrap — scale/CLAHE LoFTR + guided warp-rematch; Affine defaults."""
 from __future__ import annotations
 
 import os
@@ -53,7 +53,6 @@ else:
     )
     _src = _src.replace("feature_count = 12000\n", "feature_count = 8000\n", 1)
 
-# Defaults tuned for cross-sensor OHRC↔LROC
 _src = _src.replace(
     'st.slider("LoFTR confidence threshold", 0.10, 0.90, 0.35, 0.05)',
     'st.slider("LoFTR confidence threshold", 0.10, 0.90, 0.26, 0.05)',
@@ -264,7 +263,7 @@ if _on_cloud:
 '''
 else:
     _NEW_CROSS = '''
-            # CROSS-SENSOR: scale-aware CLAHE + full LoFTR (local GPU)
+            # CROSS-SENSOR: scale-CLAHE LoFTR + guided warp-rematch (local GPU)
             runs = []
             actual_matcher = "SIFT"
             matcher_note = "Cross-sensor"
@@ -299,11 +298,27 @@ else:
                     }
                     if len(_corrs) < 4:
                         raise ValueError(f"only {len(_corrs)} after scale-CLAHE LoFTR")
+                    try:
+                        import guided_match as _gm
+                        _corrs, _gmeta = _gm.enrich_with_guided(
+                            src.gray, ref.gray, _corrs,
+                            source_mask=src.mask, reference_mask=ref.mask,
+                            ransac_threshold=max(6.0, float(ransac_threshold)),
+                        )
+                        loftr_metrics["guided"] = _gmeta
+                        loftr_metrics["filtered_matches"] = len(_corrs)
+                        _gnote = (
+                            f" + guided({_gmeta.get('tile_matches', 0)} tiles)"
+                            if _gmeta.get("guided") else ""
+                        )
+                    except Exception as _gexc:
+                        _gnote = f" (guided skipped: {_gexc})"
                     runs = [("LoFTR-full", _corrs)]
                     actual_matcher = "LoFTR-full"
                     matcher_note = (
                         f"Scale+CLAHE LoFTR ({str(loftr_out.get('device','cpu')).upper()}): "
                         f"{loftr_out.get('raw_matches')}→{len(_corrs)}, rel_scale={loftr_out.get('rel_scale')}"
+                        f"{_gnote}"
                     )
                 except Exception as _full_exc:
                     matcher_note = f"Full LoFTR failed ({_full_exc}); SIFT fallback"
@@ -365,7 +380,7 @@ if "def _light_id" not in _src:
 _src = _src.replace(
     'key="reference"\n    )',
     'key="reference"\n    )\n'
-    '    st.info("**Local defaults:** Affine + MAGSAC thr=7 + LoFTR conf=0.26 + scale/CLAHE LoFTR. Leave RANSAC comparison OFF.")\n',
+    '    st.info("**Local defaults:** Affine + MAGSAC=7 + LoFTR=0.26 + scale/CLAHE + guided warp-rematch. Leave RANSAC comparison OFF.")\n',
     1,
 )
 
