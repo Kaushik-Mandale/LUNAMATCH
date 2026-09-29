@@ -1,7 +1,7 @@
 """Scale-aware full-image LoFTR for cross-sensor (OHRC ↔ LROC).
 
-1) Percentile stretch + CLAHE (fixes near-black OHRC previews)
-2) Coarse SIFT → relative scale
+1) Percentile stretch + CLAHE
+2) Scale: prefer metadata GSD ratio; else coarse SIFT
 3) Resize source to reference scale
 4) Full LoFTR on equalized, scale-matched pair
 5) Map coords back to original source frame
@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -32,7 +32,6 @@ def _to_u8(gray: np.ndarray) -> np.ndarray:
 
 
 def enhance_pair(src: np.ndarray, ref: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Strong contrast equalization for cross-sensor lunar imagery."""
     a = _to_u8(src)
     b = _to_u8(ref)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -57,7 +56,7 @@ def estimate_rel_scale(
     ratio: float = 0.85,
     max_side: int = 800,
 ) -> float:
-    """Median pairwise distance ratio from coarse SIFT (src/ref scale)."""
+    """Median pairwise distance ratio (src/ref) from coarse SIFT."""
     a, sa, _ = _downscale(src, max_side)
     b, sb, _ = _downscale(ref, max_side)
     sift = cv2.SIFT_create(nfeatures=nfeatures)
@@ -75,7 +74,6 @@ def estimate_rel_scale(
             good.append((k0[m[0].queryIdx].pt, k1[m[0].trainIdx].pt))
     if len(good) < 8:
         return 1.0
-    # scale from random pair distances
     rng = np.random.default_rng(0)
     ratios = []
     pts0 = np.array([g[0] for g in good], np.float64)
@@ -91,11 +89,8 @@ def estimate_rel_scale(
             ratios.append(d0 / d1)
     if not ratios:
         return 1.0
-    # undo downscale: pts already in downscaled coords; ratio is scale_src/scale_ref in that space
-    # true src/ref scale ≈ median(ratios) * (sb/sa) wait: both downscaled independently by sa,sb
-    # distance in orig_src = d0/sa, orig_ref = d1/sb → ratio_orig = (d0/sa)/(d1/sb) = (d0/d1)*(sb/sa)
     med = float(np.median(ratios))
-    return float(np.clip(med * (sb / max(sa, 1e-9)), 0.15, 8.0))
+    return float(np.clip(med * (sb / max(sa, 1e-9)), 0.12, 12.0))
 
 
 def match_cross_sensor_full(
@@ -106,22 +101,46 @@ def match_cross_sensor_full(
     min_confidence: float = 0.25,
     max_side: int = 1280,
     geom_conf_floor: float = 0.32,
+    source_gsd_m: Optional[float] = None,
+    reference_gsd_m: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Match with GSD-aware scale when available.
+
+    scale_apply resizes SOURCE so ground features match REFERENCE pixel size:
+        scale_apply ≈ source_gsd / reference_gsd
+    (OHRC 0.25 m vs LROC ~2 m → shrink source by ~0.12).
+    """
     t0 = time.perf_counter()
     src_e, ref_e = enhance_pair(source_gray, reference_gray)
 
-    rel = estimate_rel_scale(src_e, ref_e)
-    # Resize source so features are similar size to reference
-    # If src features are larger (rel>1), shrink source
+    scale_source = "sift"
+    rel = 1.0
+    if (
+        source_gsd_m is not None
+        and reference_gsd_m is not None
+        and float(source_gsd_m) > 0
+        and float(reference_gsd_m) > 0
+    ):
+        # pixels_per_meter_src / pixels_per_meter_ref = ref_gsd / src_gsd
+        # To make src features same size as ref: multiply src coords by src_gsd/ref_gsd
+        scale_apply = float(source_gsd_m) / float(reference_gsd_m)
+        rel = 1.0 / max(scale_apply, 1e-9)
+        scale_source = "metadata_gsd"
+    else:
+        rel = estimate_rel_scale(src_e, ref_e)
+        scale_apply = 1.0 / max(rel, 1e-6)
+
+    # Allow strong downscale for true GSD gaps (OHRC vs NAC)
+    scale_apply = float(np.clip(scale_apply, 0.08, 6.0))
+
     h0, w0 = src_e.shape[:2]
-    scale_apply = 1.0 / max(rel, 1e-6)
-    # clamp extreme
-    scale_apply = float(np.clip(scale_apply, 0.2, 5.0))
     nw = max(32, int(round(w0 * scale_apply)))
     nh = max(32, int(round(h0 * scale_apply)))
-    src_s = cv2.resize(src_e, (nw, nh), interpolation=cv2.INTER_AREA if scale_apply < 1 else cv2.INTER_LINEAR)
+    src_s = cv2.resize(
+        src_e, (nw, nh),
+        interpolation=cv2.INTER_AREA if scale_apply < 1 else cv2.INTER_LINEAR,
+    )
 
-    # masks scaled if present
     sm = source_mask
     if sm is not None:
         sm = cv2.resize(_to_u8(sm), (nw, nh), interpolation=cv2.INTER_NEAREST)
@@ -137,7 +156,6 @@ def match_cross_sensor_full(
         max_side=int(max_side),
     )
     corrs: List[Tuple] = list(out.get("correspondences") or [])
-    # Map source coords from scaled frame → original source pixels
     inv = 1.0 / max(scale_apply, 1e-9)
     mapped = []
     for s, r, c in corrs:
@@ -148,9 +166,9 @@ def match_cross_sensor_full(
     floor = max(float(geom_conf_floor), float(min_confidence))
     strict = [m for m in mapped if m[2] >= floor]
     if len(strict) >= 12:
-        final = strict[:72]
+        final = strict[:80]
     else:
-        final = mapped[:min(48, len(mapped))]
+        final = mapped[:min(56, len(mapped))]
 
     try:
         _lm.unload_loftr_model()
@@ -165,7 +183,10 @@ def match_cross_sensor_full(
         "device": out.get("device"),
         "rel_scale": rel,
         "scale_apply": scale_apply,
-        "mode": "full_scale_clahe",
+        "scale_source": scale_source,
+        "source_gsd_m": source_gsd_m,
+        "reference_gsd_m": reference_gsd_m,
+        "mode": "full_scale_clahe_gsd" if scale_source == "metadata_gsd" else "full_scale_clahe",
         "max_side": max_side,
         "execution_time_seconds": time.perf_counter() - t0,
     }
