@@ -1,4 +1,4 @@
-"""LunaMatch V3 bootstrap — scale/CLAHE LoFTR + guided warp-rematch; Affine defaults."""
+"""LunaMatch V3 bootstrap — GSD-aware scale + CLAHE LoFTR + guided rematch."""
 from __future__ import annotations
 
 import os
@@ -263,7 +263,7 @@ if _on_cloud:
 '''
 else:
     _NEW_CROSS = '''
-            # CROSS-SENSOR: scale-CLAHE LoFTR + guided warp-rematch (local GPU)
+            # CROSS-SENSOR: GSD-scale + CLAHE LoFTR + guided rematch (local GPU)
             runs = []
             actual_matcher = "SIFT"
             matcher_note = "Cross-sensor"
@@ -279,12 +279,40 @@ else:
                 try:
                     import cross_sensor_loftr as _cs
                     _full_side = min(int(max_side), 1280)
+                    def _pick_gsd(_meta):
+                        if not isinstance(_meta, dict):
+                            return None
+                        for _k in ("gsd_m_per_pixel", "gsd_m", "resolution_gsd", "gsd"):
+                            _v = _meta.get(_k)
+                            if _v is None and isinstance(_meta.get("metadata"), dict):
+                                _v = _meta["metadata"].get(_k)
+                            try:
+                                _f = float(_v)
+                                if _f > 0:
+                                    return _f
+                            except Exception:
+                                pass
+                        return None
+                    try:
+                        _src_gsd = _pick_gsd(source_metadata)
+                    except Exception:
+                        _src_gsd = None
+                    try:
+                        _ref_gsd = _pick_gsd(reference_metadata)
+                    except Exception:
+                        _ref_gsd = None
+                    if _src_gsd is None and str(source_sensor).upper().startswith("OHRC"):
+                        _src_gsd = 0.24
+                    if _ref_gsd is None and "LROC" in str(reference_sensor).upper():
+                        _ref_gsd = 2.0
                     loftr_out = _cs.match_cross_sensor_full(
                         source_gray=src.gray, reference_gray=ref.gray,
                         source_mask=src.mask, reference_mask=ref.mask,
                         min_confidence=min(0.20, float(loftr_confidence_threshold)),
                         max_side=_full_side,
                         geom_conf_floor=max(0.26, float(loftr_confidence_threshold)),
+                        source_gsd_m=_src_gsd,
+                        reference_gsd_m=_ref_gsd,
                     )
                     _corrs = list(loftr_out.get("correspondences") or [])
                     loftr_metrics = {
@@ -294,6 +322,8 @@ else:
                         "device": loftr_out.get("device"),
                         "mode": loftr_out.get("mode"),
                         "rel_scale": loftr_out.get("rel_scale"),
+                        "scale_apply": loftr_out.get("scale_apply"),
+                        "scale_source": loftr_out.get("scale_source"),
                         "max_side": _full_side,
                     }
                     if len(_corrs) < 4:
@@ -316,8 +346,8 @@ else:
                     runs = [("LoFTR-full", _corrs)]
                     actual_matcher = "LoFTR-full"
                     matcher_note = (
-                        f"Scale+CLAHE LoFTR ({str(loftr_out.get('device','cpu')).upper()}): "
-                        f"{loftr_out.get('raw_matches')}→{len(_corrs)}, rel_scale={loftr_out.get('rel_scale')}"
+                        f"GSD-scale LoFTR ({str(loftr_out.get('device','cpu')).upper()}): "
+                        f"{loftr_out.get('raw_matches')}→{len(_corrs)}, scale={loftr_out.get('scale_apply')} ({loftr_out.get('scale_source')})"
                         f"{_gnote}"
                     )
                 except Exception as _full_exc:
@@ -380,7 +410,7 @@ if "def _light_id" not in _src:
 _src = _src.replace(
     'key="reference"\n    )',
     'key="reference"\n    )\n'
-    '    st.info("**Local defaults:** Affine + MAGSAC=7 + LoFTR=0.26 + scale/CLAHE + guided warp-rematch. Leave RANSAC comparison OFF.")\n',
+    '    st.info("**Local:** GSD-aware scale + CLAHE LoFTR + guided rematch. Affine / MAGSAC=7 / conf=0.26 defaults.")\n',
     1,
 )
 
