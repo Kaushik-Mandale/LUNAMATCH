@@ -1,4 +1,4 @@
-"""LunaMatch V3 bootstrap — full-image LoFTR + top-conf geometry filter."""
+"""LunaMatch V3 bootstrap — scale-aware CLAHE full LoFTR (local GPU)."""
 from __future__ import annotations
 
 import os
@@ -258,7 +258,7 @@ if _on_cloud:
 '''
 else:
     _NEW_CROSS = '''
-            # CROSS-SENSOR: FULL-IMAGE LoFTR + top-confidence filter for geometry
+            # CROSS-SENSOR: scale-aware CLAHE + full LoFTR (local GPU)
             runs = []
             actual_matcher = "SIFT"
             matcher_note = "Cross-sensor"
@@ -272,42 +272,33 @@ else:
                 matcher_note = f"SIFT ({loftr_err})"
             else:
                 try:
-                    import loftr_matcher as _lm
+                    import cross_sensor_loftr as _cs
                     _full_side = min(int(max_side), 1280)
-                    loftr_out = _lm.loftr_match(
+                    loftr_out = _cs.match_cross_sensor_full(
                         source_gray=src.gray, reference_gray=ref.gray,
                         source_mask=src.mask, reference_mask=ref.mask,
                         min_confidence=min(0.20, float(loftr_confidence_threshold)),
                         max_side=_full_side,
+                        geom_conf_floor=max(0.30, float(loftr_confidence_threshold)),
                     )
                     _corrs = list(loftr_out.get("correspondences") or [])
-                    _corrs = sorted(_corrs, key=lambda t: -float(t[2]))
-                    _floor = max(0.32, float(loftr_confidence_threshold))
-                    _strict = [c for c in _corrs if float(c[2]) >= _floor]
-                    if len(_strict) >= 12:
-                        _corrs = _strict[:64]
-                    else:
-                        _corrs = _corrs[:min(40, len(_corrs))]
                     loftr_metrics = {
                         "raw_matches": loftr_out.get("raw_matches"),
                         "filtered_matches": len(_corrs),
-                        "min_confidence": _floor,
+                        "min_confidence": loftr_out.get("min_confidence"),
                         "device": loftr_out.get("device"),
-                        "mode": "full_image_topconf",
+                        "mode": loftr_out.get("mode"),
+                        "rel_scale": loftr_out.get("rel_scale"),
                         "max_side": _full_side,
                     }
                     if len(_corrs) < 4:
-                        raise ValueError(f"only {len(_corrs)} after top-conf")
+                        raise ValueError(f"only {len(_corrs)} after scale-CLAHE LoFTR")
                     runs = [("LoFTR-full", _corrs)]
                     actual_matcher = "LoFTR-full"
                     matcher_note = (
-                        f"Full-image LoFTR ({str(loftr_out.get('device','cpu')).upper()}): "
-                        f"{loftr_out.get('raw_matches')} raw → {len(_corrs)} top-conf (floor={_floor:.2f})"
+                        f"Scale+CLAHE LoFTR ({str(loftr_out.get('device','cpu')).upper()}): "
+                        f"{loftr_out.get('raw_matches')}→{len(_corrs)}, rel_scale={loftr_out.get('rel_scale')}"
                     )
-                    try:
-                        _lm.unload_loftr_model()
-                    except Exception:
-                        pass
                 except Exception as _full_exc:
                     matcher_note = f"Full LoFTR failed ({_full_exc}); SIFT fallback"
                     runs = [
@@ -328,7 +319,6 @@ _src, _n = re.subn(
 if _n != 1:
     print(f"[bootstrap] cross-sensor patch skipped (matches={_n})")
 
-# Soft-fail MAGSAC vs RANSAC comparison
 _cmp_old = (
     "if enable_comparison:\n"
     "            alt_verifier = \"RANSAC\" if verifier_selected == \"MAGSAC++\" else \"MAGSAC++\"\n"
@@ -369,7 +359,7 @@ if "def _light_id" not in _src:
 _src = _src.replace(
     'key="reference"\n    )',
     'key="reference"\n    )\n'
-    '    st.info("**Local:** Full-image LoFTR + top-confidence filter. Uncheck MAGSAC vs RANSAC comparison for cleaner runs. Try Affine model if Homography RMSE is huge.")\n',
+    '    st.info("**Local:** Scale-aware CLAHE + full LoFTR (fixes dark OHRC / GSD gap). Uncheck RANSAC comparison. Try Affine if RMSE is huge.")\n',
     1,
 )
 
