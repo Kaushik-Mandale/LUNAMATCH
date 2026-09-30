@@ -13,14 +13,17 @@ from core.pds_parser import parse_lro_pds3_label, verify_product_id
 from core.product_state import FootprintStatus, MetadataStatus, compute_footprint_status
 from core.product_state import PairValidationStatus, compute_pair_validation
 from core.scientific_reader import (
+    LROC_NAC_EDR_PROFILE,
+    apply_raster_profile,
     ScientificRasterSpec,
     check_file_size_consistency,
+    inspect_scientific_product,
     load_scientific_preview,
     open_scientific_memmap,
     persist_product,
     scientific_raster_spec,
 )
-from app_v3 import lroc_catalog_metadata_record
+from app_v3 import lroc_catalog_metadata_record, _lroc_nac_edr_catalog_raw_record
 
 
 def lro_label(product_id="M1438615574LE", pointer=1):
@@ -75,16 +78,22 @@ def test_lroc_catalog_metadata_record_for_m1438615574le():
     record = lroc_catalog_metadata_record("M1438615574LE.IMG")
     assert record["product_id"] == "M1438615574LE"
     assert record["sensor_type"] == "LROC_NAC"
-    assert record["dimensions"]["lines"] > 0
-    assert record["dimensions"]["samples"] > 0
+    assert record["dimensions"] == {"lines": 52224, "samples": 5064}
     assert record["gsd_m_per_pixel"] == 2.00920205325772
     assert record["gsd_provenance"] == "LROC_PRODUCT_RECORD"
     assert record["start_time"]
     assert record["footprint"]["upper_left"]
     assert record.get("metadata_source") == "LROC_CATALOG"
-    assert record.get("record_bytes") is None
-    assert record.get("image_offset") is None
-    assert record.get("sample_type") is None
+    # After apply_raster_profile() the LROC_NAC_EDR_PROFILE binary layout is present:
+    assert record.get("record_bytes") == 5064
+    assert record.get("sample_type") == "UNSIGNED_BYTE"
+    assert record.get("image_offset") == 5064
+    assert record.get("format_profile") == "LROC_NAC_EDR_PDS3"
+    # Raw catalog record (pre-profile) has None for binary layout fields:
+    raw = _lroc_nac_edr_catalog_raw_record("M1438615574LE")
+    assert raw.get("record_bytes") is None
+    assert raw.get("sample_type") is None
+    assert raw.get("image_offset") is None
     assert record["footprint"] == {
         "upper_left": [-88.07, 211.75],
         "upper_right": [-88.26, 197.21],
@@ -93,12 +102,74 @@ def test_lroc_catalog_metadata_record_for_m1438615574le():
     }
 
 
+def test_lroc_nac_edr_profile_is_generic_and_populates_raster_contract():
+    record = lroc_catalog_metadata_record("M1438615574LE.IMG")
+    profiled = apply_raster_profile(record, "M1438615574LE.IMG")
+    spec = scientific_raster_spec(profiled)
+    assert LROC_NAC_EDR_PROFILE.name == "LROC_NAC_EDR_PDS3"
+    assert profiled["format_profile"] == "LROC_NAC_EDR_PDS3"
+    assert profiled["raster_spec_provenance"] == "LROC EDR archive format specification"
+    assert profiled["data_set_id"] == "LRO-L-LROC-2-EDR-V1.0"
+    assert profiled["record_type"] == "FIXED_LENGTH"
+    assert profiled["label_records"] == 1
+    assert profiled["image_pointer"] == 2
+    assert spec.lines == 52224
+    assert spec.samples == 5064
+    assert spec.sample_bits == 8
+    assert spec.dtype == "uint8"
+    assert spec.sample_type == "UNSIGNED_BYTE"
+    assert spec.record_bytes == 5064
+    assert spec.image_offset == 5064
+
+
+def test_lroc_nac_edr_expected_structure_and_tolerance_states():
+    profiled = apply_raster_profile(lroc_catalog_metadata_record("M1438615574LE.IMG"), "M1438615574LE.IMG")
+    spec = scientific_raster_spec(profiled)
+    expected_payload = 52224 * 5064
+    expected_file = 52225 * 5064
+    check = check_file_size_consistency(expected_file, spec)
+    assert check["status"] == "VERIFIED"
+    assert check["expected_raster_bytes"] == expected_payload
+    assert check["expected_record_count"] == 52225
+    assert check["expected_file_size_from_records"] == expected_file
+    assert check_file_size_consistency(expected_file - 1, spec)["status"] == "PARTIAL"
+    assert check_file_size_consistency(expected_file - 5064 * 2, spec)["status"] == "MISMATCH"
+
+
+def test_lroc_catalog_profile_is_ready_without_label_but_binary_sanity_is_separate():
+    # Build a realistic LROC NAC EDR metadata dict for a second product.
+    # Dimensions come from an imaginary catalog entry; the profile supplies the binary layout.
+    generic_meta = {
+        "mission": "Lunar Reconnaissance Orbiter",
+        "instrument": "LROC NAC",
+        "sensor_type": "LROC_NAC",
+        "product_id": "M1534362340LE",
+        "data_set_id": "LRO-L-LROC-2-EDR-V1.0",
+        "product_type": "EDR",
+        "metadata_source": "LROC_CATALOG",
+        "dimensions": {"lines": 52224, "samples": 5064},
+        "raster_spec": {"lines": 52224, "samples": 5064},
+        "valid": True,
+        "validation_errors": [],
+    }
+    profiled = apply_raster_profile(generic_meta, "M1534362340LE.IMG")
+    assert profiled["format_profile"] == "LROC_NAC_EDR_PDS3"
+    assert scientific_raster_spec(profiled).is_decodable() is True
+    report = inspect_scientific_product(b"", "M1534362340LE.IMG", profiled)
+    assert report["format_profile"] == "LROC_NAC_EDR_PDS3"
+    assert report["decoding_status"] in {"PARTIAL", "MISMATCH", "RASTER_DECODE_ERROR"}
+
+
 def test_lroc_catalog_gsd_is_not_replaced_by_derived_value():
     record = lroc_catalog_metadata_record("M1438615574LE.IMG")
     assert record["catalog_gsd_m_per_pixel"] == 2.00920205325772
     assert record["gsd_m_per_pixel"] == record["catalog_gsd_m_per_pixel"]
     assert record.get("derived_gsd_m_per_pixel") is None
-    assert scientific_raster_spec(record).is_decodable() is False
+    # The raw pre-profile catalog record is NOT decodable (no binary layout):
+    raw = _lroc_nac_edr_catalog_raw_record("M1438615574LE")
+    assert scientific_raster_spec(raw).is_decodable() is False
+    # The profile-applied record IS decodable (correct behavior):
+    assert scientific_raster_spec(record).is_decodable() is True
     assert record["gsd_m_per_pixel"] / 0.24 == pytest.approx(8.371675221907166)
 
 

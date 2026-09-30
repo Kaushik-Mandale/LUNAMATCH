@@ -57,6 +57,8 @@ from core.product_state import (
 from core.scientific_reader import (
     ProductType,
     ScientificRasterSpec,
+    apply_raster_profile,
+    build_raster_contract,
     check_file_size_consistency,
     classify_product,
     classify_product_display_label,
@@ -65,6 +67,7 @@ from core.scientific_reader import (
     load_product,
     get_raster_shape,
     get_raster_dtype,
+    sample_type_display,
 )
 from experiments.manager import ExperimentManager
 
@@ -1135,31 +1138,28 @@ def parse_metadata_xml(data: bytes | str, name: str = "") -> dict:
     """Wrapper that delegates to PDS3 or PDS4 parser based on content."""
     sample = (data[:2000].decode("ascii", errors="replace") if isinstance(data, bytes) else str(data)[:2000]).lower()
     if "pds_version_id" in sample or "record_type" in sample or "lroc" in sample or ("lines" in sample and "^image" in sample):
-        return parse_lro_pds3_label(data, name)
+        return apply_raster_profile(parse_lro_pds3_label(data, name), name)
     return parse_chandrayaan2_pds4_xml(data, name)
 
 
-def lroc_catalog_metadata_record(image_name: str) -> dict:
-    """Return verified LROC catalog metadata for known LRO NAC products.
+def _lroc_nac_edr_catalog_raw_record(product_id: str) -> "dict | None":
+    """Return the raw verified catalog record for a known LROC NAC EDR product.
 
-    This provider is first-class metadata, not a fallback invented from the raster file.
-    It is intentionally limited to the fields that are actually known from the verified
-    catalog record and does not fabricate PDS3 record structure fields such as
-    RECORD_BYTES, ^IMAGE, SAMPLE_TYPE, or byte offsets when they are unavailable.
+    Returns None for products not in the explicit catalog.
+    This is the pre-profile record: binary layout fields (RECORD_BYTES, ^IMAGE,
+    SAMPLE_TYPE, IMAGE_OFFSET) are absent because the catalog does not publish
+    them — they are supplied by LROC_NAC_EDR_PROFILE via apply_raster_profile().
     """
-    product_id = _normalise_product_id(image_name) if image_name else ""
-    if not product_id:
-        return empty_metadata_template()
-
-    # Keep this as a real catalog-backed record for a known LROC NAC image ID.
-    # The values below are intentionally explicit and provenance-marked.
-    base = product_id.upper()
+    base = (product_id or "").upper()
     if base == "M1438615574LE":
-        record = {
+        return {
             "mission": "Lunar Reconnaissance Orbiter",
             "instrument": "LROC NAC",
             "sensor_type": "LROC_NAC",
             "product_id": "M1438615574LE",
+            "data_set_id": "LRO-L-LROC-2-EDR-V1.0",
+            "record_type": "FIXED_LENGTH",
+            "product_type": "EDR",
             "processing_level": "EDR",
             "target": "Moon",
             "start_time": "2016-01-01T00:00:00.000Z",
@@ -1183,7 +1183,8 @@ def lroc_catalog_metadata_record(image_name: str) -> dict:
                 "lower_left": [-88.96, 293.28],
                 "lower_right": [-89.40, 311.20],
             },
-            "dimensions": {"lines": 1024, "samples": 1024},
+            "dimensions": {"lines": 52224, "samples": 5064},
+            # Binary layout fields: absent from catalog — supplied by LROC_NAC_EDR_PROFILE
             "data_type": None,
             "sample_bits": None,
             "sample_type": None,
@@ -1192,9 +1193,11 @@ def lroc_catalog_metadata_record(image_name: str) -> dict:
             "record_bytes": None,
             "image_pointer": None,
             "image_pointer_unit": None,
+            # raster_spec mirrors catalog dimensions; binary layout fields are None
+            # until apply_raster_profile() merges the LROC_NAC_EDR_PROFILE.
             "raster_spec": {
-                "lines": 1024,
-                "samples": 1024,
+                "lines": 52224,
+                "samples": 5064,
                 "sample_bits": None,
                 "dtype": None,
                 "sample_type": None,
@@ -1211,9 +1214,114 @@ def lroc_catalog_metadata_record(image_name: str) -> dict:
             "validation_errors": [],
             "validation_warnings": [],
         }
-        return record
+    return None
+
+
+def _lroc_nac_edr_family_record(product_id: str) -> "dict | None":
+    """Return a minimal LROC NAC EDR family record for any M\\d+[LR]E product.
+
+    Used when the product is recognisably in the LROC NAC EDR family by filename
+    pattern but is not in the explicit per-product catalog.  Dimensions are NOT
+    fabricated — they remain None until supplied by the user or a label file.
+    The record provides enough family metadata for apply_raster_profile() to
+    attach the binary layout profile once dimensions are available.
+    """
+    import re as _re
+    if not _re.match(r"^M\d+[LR]E$", (product_id or "").upper()):
+        return None
+    return {
+        "mission": "Lunar Reconnaissance Orbiter",
+        "instrument": "LROC NAC",
+        "sensor_type": "LROC_NAC",
+        "product_id": product_id.upper(),
+        "data_set_id": "LRO-L-LROC-2-EDR-V1.0",
+        "record_type": "FIXED_LENGTH",
+        "product_type": "EDR",
+        "processing_level": "EDR",
+        "target": "Moon",
+        "start_time": None,
+        "stop_time": None,
+        "gsd_m_per_pixel": None,
+        "catalog_gsd_m_per_pixel": None,
+        "derived_gsd_m_per_pixel": None,
+        "gsd_provenance": None,
+        "altitude_km": None,
+        "roll_deg": None,
+        "pitch_deg": None,
+        "yaw_deg": None,
+        "sun_azimuth_deg": None,
+        "sun_elevation_deg": None,
+        "solar_incidence_deg": None,
+        "projection": None,
+        "area": None,
+        "footprint": {"upper_left": [], "upper_right": [], "lower_left": [], "lower_right": []},
+        "dimensions": {"lines": None, "samples": None},
+        "data_type": None,
+        "sample_bits": None,
+        "sample_type": None,
+        "byte_order": None,
+        "image_offset": None,
+        "record_bytes": None,
+        "image_pointer": None,
+        "image_pointer_unit": None,
+        "raster_spec": {
+            "lines": None,
+            "samples": None,
+            "sample_bits": None,
+            "dtype": None,
+            "sample_type": None,
+            "byte_order": None,
+            "image_offset": None,
+            "image_pointer": None,
+            "image_pointer_unit": None,
+            "record_bytes": None,
+            "product_id": product_id.upper(),
+        },
+        "metadata_source": "LROC_CATALOG",
+        "provenance": "LROC_NAC_EDR_FAMILY_RECOGNITION",
+        "valid": False,
+        "validation_errors": ["Image dimensions not yet known for this LROC NAC EDR product."],
+        "validation_warnings": [],
+    }
+
+
+def lroc_catalog_metadata_record(image_name: str) -> dict:
+    """Return verified LROC catalog metadata for known LRO NAC products.
+
+    Provider order:
+    1. Explicit per-product verified catalog record (full metadata + LROC_NAC_EDR_PROFILE).
+    2. Generic LROC NAC EDR family recognition for any M\\d+[LR]E product
+       (family metadata only; dimensions remain None until supplied).
+    3. Empty template for unrecognised products.
+
+    The LROC_NAC_EDR raster binary layout (RECORD_BYTES, ^IMAGE, SAMPLE_TYPE,
+    IMAGE_OFFSET) is never fabricated from the catalog.  It is always supplied by
+    the LROC_NAC_EDR_PROFILE through apply_raster_profile(), which is generic
+    across the entire LROC NAC EDR archive.
+
+    M1438615574LE is the current acceptance test product; this function is NOT
+    limited to that single product ID.
+    """
+    product_id = _normalise_product_id(image_name) if image_name else ""
+    if not product_id:
+        return empty_metadata_template()
+
+    # 1. Explicit per-product verified catalog record
+    raw = _lroc_nac_edr_catalog_raw_record(product_id)
+    if raw is not None:
+        return apply_raster_profile(raw, image_name)
+
+    # 2. Generic LROC NAC EDR family recognition (M\d+[LR]E pattern)
+    family = _lroc_nac_edr_family_record(product_id)
+    if family is not None:
+        # apply_raster_profile requires known dimensions; skip profile if absent
+        dims = family.get("dimensions") or {}
+        if dims.get("lines") and dims.get("samples"):
+            return apply_raster_profile(family, image_name)
+        return family
 
     return empty_metadata_template()
+
 
 
 def provide_reference_metadata(reference_file, reference_meta_file=None, reference_catalog_file=None, is_pair_001=False):
@@ -2050,7 +2158,14 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
                  geometric_verifier="MAGSAC++", loftr_confidence_threshold=0.35,
                  iirs_representation="automatic", pca_component=1,
                  iirs_normalization="percentile", iirs_invalid_handling="automatic",
-                 iirs_resolution_handling="automatic"):
+                 iirs_resolution_handling="automatic",
+                 enforce_geographic_overlap: bool = True):
+    """Run the full correspondence -> geometry -> validation -> refinement pipeline.
+
+    ``enforce_geographic_overlap`` gates geographic validation only. Raster
+    decoding, binary consistency, image loading and preprocessing safety checks
+    are ALWAYS enforced in both scientific and experimental execution modes.
+    """
 
     start_total = time.perf_counter()
     stages = []
@@ -2097,8 +2212,13 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
                            "Metadata report", {"sensor_path": classify_sensor_path(source_sensor, reference_sensor)},
                            metadata, processing_time, metadata_error))
 
-    overlap = geographic_overlap(source_metadata or {}, reference_metadata or {})
-    if overlap["available"] and not overlap["overlap"]:
+    # Geographic validation is an INDEPENDENT gate from raster validation.
+    # Experimental mode may bypass the geographic gate, but it must never bypass
+    # raster decoding, binary consistency, image loading, or preprocessing safety.
+    geo_overlap = geographic_overlap(source_metadata or {}, reference_metadata or {})
+    overlap_rejected = bool(geo_overlap["available"] and not geo_overlap["overlap"])
+    geographic_validation_bypassed = bool(overlap_rejected and not enforce_geographic_overlap)
+    if overlap_rejected and enforce_geographic_overlap:
         raise ValueError(
             "No meaningful geographic overlap detected between source and reference footprints. "
             "Cross-sensor correspondence is not scientifically meaningful for this image pair."
@@ -2656,6 +2776,27 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
         "subpixel_accuracy_certified": False,
         "H_source_working_to_reference_working": H.tolist(),
         "H_source_original_to_reference_original": H_original.tolist(),
+        # Geographic validation is a SEPARATE gate from raster validation.
+        "geographic_validation": {
+            "enforced": bool(enforce_geographic_overlap),
+            "overlap_available": bool(geo_overlap.get("available")),
+            "overlap_detected": bool(geo_overlap.get("overlap")),
+            "bypassed": geographic_validation_bypassed,
+            "message": (
+                "Geographic validation BYPASSED (experimental image-only mode). "
+                "No geographic overlap, geographic consistency or metadata-based scale claim is made."
+                if geographic_validation_bypassed else
+                "Geographic overlap validated against the source/reference footprints."
+                if geo_overlap.get("available") else
+                "Geographic overlap unavailable from the supplied metadata."
+            ),
+        },
+        # Raster validation is ALWAYS enforced, in every execution mode.
+        "raster_validation": {
+            "source_decoding_status": si.get("decoding_status") if isinstance(si, dict) else None,
+            "reference_decoding_status": ri.get("decoding_status") if isinstance(ri, dict) else None,
+            "reference_source_type": ref.info.get("format", "Scientific Raster") if ref else None,
+        },
         "scientific_caveats": [
             "Holdout validation uses withheld image correspondences, not independent ground-truth checkpoints.",
             "The smooth residual field is an empirical correction, not a physical DEM/terrain model.",
@@ -2663,6 +2804,12 @@ def run_pipeline(source_file, reference_file, source_sensor, reference_sensor,
             "Full-resolution scientific GeoTIFF output requires preservation of mission metadata and georeferencing.",
         ],
     }
+
+    if geographic_validation_bypassed:
+        report["scientific_caveats"].append(
+            "Experimental image-only mode: geographic overlap, geographic consistency and "
+            "metadata-based scale validation were NOT enforced for this run."
+        )
 
     # Align the runtime stage trace exactly to the requested UI architecture flow.
     # Keep the functional stages that actually produce the requested pipeline artifacts and
@@ -2972,20 +3119,30 @@ with metadata_expander:
                 f"{len(reference_file.getvalue())/(1024**2):.1f} MB"
             )
 
-        # ── Option A: Upload Reference Label / Metadata
-        st.markdown("**Option A: Upload .LBL / XML Label**")
-        reference_meta_file = st.file_uploader(
-            "Upload reference metadata/XML/LBL",
-            type=["xml", "txt", "lbl"],
-            key="reference_meta_xml",
-        )
+        # Check automatic recognition for reference product
+        _ref_auto_meta = None
+        if reference_file is not None and not is_pair_001:
+            _auto_cat = lroc_catalog_metadata_record(getattr(reference_file, "name", ""))
+            if _auto_cat.get("product_id") and _auto_cat.get("format_profile"):
+                _ref_auto_meta = _auto_cat
+                st.success("✓ LROC EDR format recognized automatically")
+                st.caption("Optional: upload original PDS3 label or catalog JSON for additional provenance.")
 
-        reference_catalog_file = st.file_uploader(
-            "Option B: Upload verified LROC catalog metadata (JSON)",
-            type=["json"],
-            key="reference_catalog_json",
-            help="Catalog values are labeled as catalog metadata and are never treated as embedded in the image.",
-        )
+        # ── Option A / B: Upload Reference Label / Metadata (Optional Fallback)
+        with st.expander("Optional: Upload Original PDS3 Label (.LBL / .XML) or Catalog JSON", expanded=(_ref_auto_meta is None)):
+            st.markdown("**Option A: Upload .LBL / XML Label**")
+            reference_meta_file = st.file_uploader(
+                "Upload reference metadata/XML/LBL",
+                type=["xml", "txt", "lbl"],
+                key="reference_meta_xml",
+            )
+
+            reference_catalog_file = st.file_uploader(
+                "Option B: Upload verified LROC catalog metadata (JSON)",
+                type=["json"],
+                key="reference_catalog_json",
+                help="Catalog values are labeled as catalog metadata and are never treated as embedded in the image.",
+            )
 
         if reference_meta_file is not None:
             reference_xml_bytes = reference_meta_file.getvalue()
@@ -2998,6 +3155,7 @@ with metadata_expander:
             try:
                 reference_meta = json.loads(reference_catalog_file.getvalue().decode("utf-8"))
                 reference_meta["metadata_source"] = "LROC_CATALOG"
+                reference_meta = apply_raster_profile(reference_meta, getattr(reference_file, "name", ""))
                 reference_meta_source = "CATALOG_METADATA"
                 st.caption(f"Catalog record: **{reference_catalog_file.name}**")
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
@@ -3010,6 +3168,10 @@ with metadata_expander:
             reference_meta = PAIR_001_REFERENCE.to_canonical_dict()
             st.caption("🔵 Demo metadata loaded by explicit DEMO MODE selection.")
             reference_meta_source = "DEMO"
+        elif _ref_auto_meta is not None:
+            reference_meta = _ref_auto_meta
+            reference_meta_source = "CATALOG_METADATA"
+            st.caption("✅ Verified LROC catalog record and format profile active automatically.")
         elif reference_file is not None and verify_product_id(
             getattr(reference_file, "name", ""),
             _normalise_product_id(getattr(reference_file, "name", ""))
@@ -3055,30 +3217,39 @@ with metadata_expander:
         _ref_spec_dict = reference_meta.get("raster_spec")
         if reference_file is not None and _ref_spec_dict and _ref_spec_dict.get("lines"):
             try:
-                _raster_contract_complete = all(
-                    _ref_spec_dict.get(field) is not None
-                    for field in ("lines", "samples", "sample_bits", "dtype", "image_offset")
-                )
-                if not _raster_contract_complete:
+                _spec_obj = scientific_raster_spec(reference_meta)
+                if not _spec_obj.is_decodable():
                     st.info("⏳ Raster consistency check pending: reference metadata does not declare a complete raster byte contract.")
                     raise StopIteration
-                _spec_obj = ScientificRasterSpec(
-                    lines=int(_ref_spec_dict.get("lines", 0)),
-                    samples=int(_ref_spec_dict.get("samples", 0)),
-                    sample_bits=int(_ref_spec_dict.get("sample_bits")),
-                    sample_type=_ref_spec_dict.get("sample_type"),
-                    image_offset=int(_ref_spec_dict.get("image_offset")),
-                    product_id=str(_ref_spec_dict.get("product_id") or ""),
-                )
-                _size_check = check_file_size_consistency(len(reference_file.getvalue()), _spec_obj)
-                if _size_check["status"] == "CONSISTENT":
-                    st.success(_size_check["message"])
+                _file_size = len(reference_file.getvalue()) if hasattr(reference_file, "getvalue") else getattr(reference_file, "size", 0)
+                _size_check = check_file_size_consistency(_file_size, _spec_obj)
+                reference_meta["raster_consistency"] = _size_check
+                if _size_check["status"] in ("VERIFIED", "CONSISTENT"):
+                    st.success(f"✓ {_size_check['message']}")
                 elif _size_check["status"] == "MISMATCH":
-                    st.error(_size_check["message"])
+                    st.error(f"🔴 {_size_check['message']}")
                     reference_meta.setdefault("validation_errors", []).append(_size_check["message"])
                     reference_meta["valid"] = False
                 else:
                     st.info(_size_check["message"])
+
+                # Expose clear provenance & raster specifications when LROC profile is active
+                if reference_meta.get("format_profile"):
+                    with st.expander("🔬 REFERENCE RASTER Specification", expanded=True):
+                        col_r1, col_r2 = st.columns(2)
+                        with col_r1:
+                            st.markdown(f"**Product:** `{reference_meta.get('product_id') or '—'}`")
+                            st.markdown(f"**Format:** `{reference_meta.get('format_profile')}`")
+                            st.markdown(f"**Dimensions:** `{_spec_obj.lines} × {_spec_obj.samples}`")
+                            st.markdown(f"**Sample type:** `{_spec_obj.sample_type or _spec_obj.dtype}`")
+                        with col_r2:
+                            st.markdown(f"**Record bytes:** `{_spec_obj.record_bytes}`")
+                            st.markdown(f"**Image pointer:** Record 2")
+                            st.markdown(f"**Image offset:** `{_spec_obj.image_offset:,} bytes`")
+                            _exp_payload = int(_spec_obj.lines) * int(_spec_obj.samples) * (int(_spec_obj.sample_bits or 8) // 8)
+                            st.markdown(f"**Expected image payload:** `{_exp_payload:,} bytes`")
+                        st.caption(f"**Raster consistency:** ✓ {_size_check['status']} AGAINST LROC EDR FORMAT")
+                        st.caption(f"**Provenance:** {reference_meta.get('raster_spec_provenance', 'LROC EDR archive format specification')} + {reference_meta.get('binary_consistency_provenance', 'binary size check')}")
             except StopIteration:
                 pass
             except Exception as _sc_err:
@@ -3574,6 +3745,9 @@ image_only_ready = bool(source_file and reference_file and ref_can_decode)
 if execution_mode == "Scientific / validated mode" and not scientific_ready:
     if _pid_status == "MISMATCH":
         st.error("🔴 RUN BLOCKED: Reference image and metadata refer to different products.")
+    elif (si and si.get("decoding_status") != "READY") or (ri and ri.get("decoding_status") != "READY"):
+        _raster_err = (ri.get("raster_access") or {}).get("message") or ri.get("message") or "Scientific raster decoding has not been independently verified."
+        st.error(f"🔴 RUN BLOCKED: {_raster_err}")
     elif footprint_eval.get("status") == "insufficient_overlap":
         _pct = footprint_eval.get("intersection_percent_of_smaller", 0.0)
         _minimum = footprint_eval.get("minimum_overlap_percentage", 0.1)
@@ -3583,8 +3757,6 @@ if execution_mode == "Scientific / validated mode" and not scientific_ready:
         )
     elif footprint_eval.get("status") == "rejected":
         st.error("🔴 RUN BLOCKED: Source and reference footprints have zero geographic overlap.")
-    elif (si and si.get("decoding_status") != "READY") or (ri and ri.get("decoding_status") != "READY"):
-        st.error("🔴 RUN BLOCKED: Scientific raster decoding has not been independently verified.")
     else:
         st.error("RUN BLOCKED: Scientific mode requires source/reference metadata and confirmed geographic overlap.")
 elif execution_mode == "Experimental image-only mode":
