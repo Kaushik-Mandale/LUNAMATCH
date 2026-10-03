@@ -3791,6 +3791,7 @@ if run:
                 iirs_normalization=iirs_normalization,
                 iirs_invalid_handling=iirs_invalid_handling,
                 iirs_resolution_handling=iirs_resolution_handling,
+                enforce_geographic_overlap=(execution_mode == "Scientific / validated mode"),
             )
         st.session_state["result"] = result
 
@@ -3811,6 +3812,7 @@ if run:
                     iirs_normalization=iirs_normalization,
                     iirs_invalid_handling=iirs_invalid_handling,
                     iirs_resolution_handling=iirs_resolution_handling,
+                    enforce_geographic_overlap=(execution_mode == "Scientific / validated mode"),
                 )
 
             st.session_state["comp_result"] = comp_result
